@@ -15,6 +15,7 @@ from app.core.security import (
 )
 from app.db.session import async_session, engine
 from app.models.base import Base
+import app.models.tables  # noqa: F401 — ensure all models are registered in Base.metadata
 
 
 @asynccontextmanager
@@ -24,9 +25,22 @@ async def lifespan(app: FastAPI):
         await conn.execute(
             __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
         )
-        await conn.run_sync(
-            __import__("app.models.base", fromlist=["Base"]).Base.metadata.create_all
+        # price_cache replaced by in-memory cache — drop if still exists
+        await conn.execute(
+            __import__("sqlalchemy").text("DROP TABLE IF EXISTS price_cache")
         )
+        await conn.run_sync(Base.metadata.create_all)
+    # Mark any tasks that were "running" when the server last died as errors
+    from sqlalchemy import update as sa_update
+    from app.models.tables import IngestTask
+    async with async_session() as db:
+        await db.execute(
+            sa_update(IngestTask)
+            .where(IngestTask.status == "running")
+            .values(status="error", error="Server restarted — task was interrupted.")
+        )
+        await db.commit()
+
     # Seed admin user, alias cache, and anonymization rules
     async with async_session() as db:
         await ensure_admin_exists(db)

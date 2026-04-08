@@ -190,10 +190,13 @@ async def ensure_admin_exists(db: AsyncSession) -> None:
 async def ensure_anon_rules_seeded(db: AsyncSession) -> None:
     """Seed AnonymizationRule table from ANON_EXTRA_RULES env var. Idempotent.
 
-    ANON_EXTRA_RULES should be a JSON array of [pattern, replacement, category] tuples.
-    Example: [["\\\\bRealName\\\\b", "TheAnalyst", "name"], ...]
+    ANON_EXTRA_RULES should be a JSON array of [term, replacement, category] tuples.
+    Use plain text terms — word boundaries are added automatically for name/handle categories.
+    Example: [["Real Name", "Sid Sloth", "name"], ["real_handle", "sid_sloth", "handle"]]
     Set this in .env or Railway environment variables — never commit real names to code.
     """
+    import re as _re
+
     if not settings.anon_extra_rules:
         return
 
@@ -206,15 +209,23 @@ async def ensure_anon_rules_seeded(db: AsyncSession) -> None:
     existing = await db.execute(select(AnonymizationRule.original_term))
     existing_set = {row[0] for row in existing.all()}
 
-    new_entries = [
-        AnonymizationRule(
-            original_term=rule[0],
-            replacement=rule[1],
-            category=rule[2] if len(rule) > 2 else "name",
-        )
-        for rule in raw_rules
-        if len(rule) >= 2 and rule[0] not in existing_set
-    ]
+    new_entries = []
+    for rule in raw_rules:
+        if len(rule) < 2:
+            continue
+        term, replacement = rule[0], rule[1]
+        category = rule[2] if len(rule) > 2 else "name"
+        # Build regex: word-boundary wrap for name/handle, literal pattern otherwise
+        if category in ("name", "handle"):
+            pattern = r"\b" + _re.escape(term) + r"\b"
+        else:
+            pattern = term
+        if pattern not in existing_set:
+            new_entries.append(AnonymizationRule(
+                original_term=pattern,
+                replacement=replacement,
+                category=category,
+            ))
     if new_entries:
         db.add_all(new_entries)
         await db.commit()

@@ -63,7 +63,10 @@ class Settings(BaseSettings):
     # Price data
     price_cache_ttl_seconds: int = 300  # 5 minutes
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": [".env", "../.env"],  # works from backend/ or repo root
+        "env_file_encoding": "utf-8",
+    }
 
 
 settings = Settings()

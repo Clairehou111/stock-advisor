@@ -205,10 +205,18 @@ async def _extract_signals_chunk(text: str) -> list[dict]:
         return []
 
 
-async def _extract_signals(sections: list[dict], publish_date: date | None) -> list[dict]:
+async def _extract_signals(
+    sections: list[dict],
+    publish_date: date | None,
+    progress_cb=None,
+) -> list[dict]:
     """Extract trade signals section by section to avoid context overload."""
     all_signals: list[dict] = []
-    for section in sections:
+    total = len(sections)
+    for i, section in enumerate(sections, 1):
+        title = section.get('title', '?')
+        if progress_cb:
+            await progress_cb(f"Extracting signals {i}/{total}: {title}")
         text = " ".join(n["text"] for n in section["nodes"] if n["type"] == "text")
         if not text.strip():
             continue
@@ -543,7 +551,7 @@ async def ingest_patreon_post(
 
     # 4. Extract trade signals per section
     await _log("Extracting trade signals...")
-    raw_signals = await _extract_signals(sections, publish_date)
+    raw_signals = await _extract_signals(sections, publish_date, progress_cb=_log)
 
     signal_count = 0
     for sig in raw_signals:
