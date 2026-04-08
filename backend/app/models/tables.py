@@ -271,6 +271,20 @@ class PriceCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# ── Ingest Tasks ─────────────────────────────────────────────────────────────
+
+
+class IngestTask(Base):
+    __tablename__ = "ingest_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)          # UUID string
+    status: Mapped[str] = mapped_column(String(20), default="running")     # running / done / error
+    messages: Mapped[list] = mapped_column(JSONB, default=list)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # ── Entity Alias Cache ────────────────────────────────────────────────────────
 # Maps user-typed aliases (typos, nicknames, shorthands) → canonical symbols.
 # Seeded with known aliases on startup; grows automatically as LLM resolves new ones.
