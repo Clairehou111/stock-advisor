@@ -178,6 +178,16 @@ def upgrade() -> None:
         sa.Column("fetched_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
+    op.create_table(
+        "ingest_tasks",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("status", sa.String(20), default="running"),
+        sa.Column("messages", JSONB, default=list),
+        sa.Column("result", JSONB, nullable=True),
+        sa.Column("error", sa.Text, nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+
 
 def downgrade() -> None:
     op.drop_table("price_cache")
@@ -192,3 +202,4 @@ def downgrade() -> None:
     op.drop_table("messages")
     op.drop_table("conversations")
     op.drop_table("users")
+    op.drop_table("ingest_tasks")
