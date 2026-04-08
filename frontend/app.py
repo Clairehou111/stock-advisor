@@ -328,17 +328,34 @@ def render_chat():
 
 # ── Admin Page ────────────────────────────────────────────────────────────────
 
+def _task_progress(messages: list[str], key: str) -> None:
+    """Collapsed expander showing last 30 progress lines."""
+    with st.expander("Progress log", expanded=False):
+        for line in messages[-30:]:
+            st.text(f"  {line}")
+
+
 def render_admin():
-    col1, col2 = st.columns([5, 1])
+    col1, col2, col3 = st.columns([5, 1, 1])
     with col1:
         st.title("⚙️ Admin — Ingestion")
     with col2:
-        if st.button("← Back to Chat", use_container_width=True):
+        if st.button("← Chat", use_container_width=True):
             st.session_state.page = "chat"
             _save_page_to_url("chat")
             st.rerun()
+    with col3:
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.token = None
+            st.session_state.is_admin = False
+            st.session_state.page = "chat"
+            _clear_token_from_url()
+            st.rerun()
 
     st.divider()
+
+    # Track whether any section has a running task (rerun fired at very end)
+    needs_rerun = False
 
     # ── Patreon post ingestion ────────────────────────────────────────────────
     st.subheader("Patreon Post")
@@ -349,59 +366,50 @@ def render_admin():
 
     task_id = st.session_state.patreon_task_id
 
-    # ── Case 1: task is running — show live progress ──────────────────────────
     if task_id:
         status = api_get_task_status(task_id, st.session_state.token)
-
         if status is None:
-            st.warning("Task not found on server — it may have been lost due to a server restart.")
+            st.warning("Task not found — server may have restarted.")
             if st.button("Dismiss", key="dismiss_lost"):
                 st.session_state.patreon_task_id = None
-                st.session_state.patreon_task_done = None
                 _clear_task_from_url()
                 st.rerun()
-
         elif status["status"] == "running":
-            st.info("Ingestion in progress — you can navigate away and come back anytime.")
+            st.info("Ingestion in progress…")
             messages = status.get("messages", [])
             if messages:
-                with st.container(border=True):
-                    for line in messages:
-                        st.text(f"  {line}")
+                _task_progress(messages, "patreon_prog")
             else:
-                st.text("  Starting...")
-            time.sleep(2)
-            st.rerun()
-
+                st.caption("Starting…")
+            if st.button("Cancel", key="patreon_cancel"):
+                st.session_state.patreon_task_id = None
+                _clear_task_from_url()
+                st.rerun()
+            needs_rerun = True
         elif status["status"] == "done":
             result = status.get("result", {})
             st.success("Ingestion complete!")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Chunks stored", result.get("chunk_count", 0))
-            col2.metric("Trade signals", result.get("signal_count", 0))
-            col3.metric("Charts analyzed", result.get("image_count", 0))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Chunks", result.get("chunk_count", 0))
+            c2.metric("Signals", result.get("signal_count", 0))
+            c3.metric("Charts", result.get("image_count", 0))
             st.caption(f"Post: **{result.get('title', '')}**")
-            st.caption(f"Upload source ID: `{result.get('upload_source_id', '')}`")
+            messages = status.get("messages", [])
+            if messages:
+                _task_progress(messages, "patreon_done_prog")
             if st.button("Ingest another post", key="patreon_reset"):
                 st.session_state.patreon_task_id = None
-                st.session_state.patreon_task_done = None
                 _clear_task_from_url()
                 st.rerun()
-
         elif status["status"] == "error":
             st.error(f"Ingestion failed: {status.get('error', 'Unknown error')}")
             messages = status.get("messages", [])
             if messages:
-                with st.expander("Progress log"):
-                    for line in messages:
-                        st.text(f"  {line}")
+                _task_progress(messages, "patreon_err_prog")
             if st.button("Try again", key="patreon_retry"):
                 st.session_state.patreon_task_id = None
-                st.session_state.patreon_task_done = None
                 _clear_task_from_url()
                 st.rerun()
-
-    # ── Case 2: no active task — show input form ──────────────────────────────
     else:
         with st.form("patreon_ingest_form"):
             post_input = st.text_input(
@@ -409,10 +417,8 @@ def render_admin():
                 placeholder="https://www.patreon.com/posts/oil-war-154313150  or  154313150",
             )
             force = st.checkbox(
-                "Force re-ingest",
-                value=False,
-                help="Wipe all existing chunks/signals for this post and re-process from scratch. "
-                     "Use this after significantly improving ingestion prompts.",
+                "Force re-ingest", value=False,
+                help="Wipe existing chunks/signals and re-process from scratch.",
             )
             submitted = st.form_submit_button("Ingest Post", use_container_width=True)
 
@@ -442,26 +448,28 @@ def render_admin():
     if excel_task_id:
         status = api_get_task_status(excel_task_id, st.session_state.token)
         if status is None:
-            st.error("Lost connection to task.")
+            st.warning("Task not found — server may have restarted.")
             st.session_state.excel_task_id = None
         elif status["status"] == "running":
-            st.info("Excel ingestion in progress...")
+            st.info("Excel ingestion in progress…")
             messages = status.get("messages", [])
             if messages:
-                with st.expander("Progress log", expanded=True):
-                    for line in messages[-20:]:
-                        st.text(f"  {line}")
+                _task_progress(messages, "excel_prog")
             else:
-                st.text("  Starting...")
-            time.sleep(2)
-            st.rerun()
+                st.caption("Starting…")
+            if st.button("Cancel", key="excel_cancel"):
+                st.session_state.excel_task_id = None
+                st.rerun()
+            needs_rerun = True
         elif status["status"] == "done":
             result = status.get("result", {})
             st.success("Excel ingestion complete!")
-            col1, col2 = st.columns(2)
-            col1.metric("Stocks upserted", result.get("stock_count", 0))
-            col2.metric("Principles processed", result.get("principle_count", 0))
-            st.caption(f"Upload source ID: `{result.get('upload_source_id', '')}`")
+            c1, c2 = st.columns(2)
+            c1.metric("Stocks upserted", result.get("stock_count", 0))
+            c2.metric("Principles", result.get("principle_count", 0))
+            messages = status.get("messages", [])
+            if messages:
+                _task_progress(messages, "excel_done_prog")
             if st.button("Upload another workbook", key="excel_reset"):
                 st.session_state.excel_task_id = None
                 st.rerun()
@@ -469,26 +477,21 @@ def render_admin():
             st.error(f"Ingestion failed: {status.get('error', 'Unknown error')}")
             messages = status.get("messages", [])
             if messages:
-                with st.expander("Error log"):
-                    for line in messages:
-                        st.text(f"  {line}")
+                _task_progress(messages, "excel_err_prog")
             if st.button("Try again", key="excel_retry"):
                 st.session_state.excel_task_id = None
                 st.rerun()
     else:
         excel_file = st.file_uploader("Choose .xlsx file", type=["xlsx"], key="excel_uploader")
         if excel_file is not None:
-            if st.button("Ingest Excel", use_container_width=False, key="excel_btn"):
-                with st.spinner("Uploading..."):
-                    resp = api_start_excel_ingest(
-                        excel_file.read(), excel_file.name, st.session_state.token
-                    )
+            if st.button("Ingest Excel", key="excel_btn"):
+                with st.spinner("Uploading…"):
+                    resp = api_start_excel_ingest(excel_file.read(), excel_file.name, st.session_state.token)
                 if resp and "task_id" in resp:
                     st.session_state.excel_task_id = resp["task_id"]
                     st.rerun()
                 else:
-                    err = resp.get("error", "Unknown error") if resp else "No response"
-                    st.error(f"Failed to start ingestion: {err}")
+                    st.error(resp.get("error", "Unknown error") if resp else "No response")
 
     st.divider()
 
@@ -503,25 +506,27 @@ def render_admin():
     if doc_task_id:
         status = api_get_task_status(doc_task_id, st.session_state.token)
         if status is None:
-            st.error("Lost connection to task.")
+            st.warning("Task not found — server may have restarted.")
             st.session_state.doc_task_id = None
         elif status["status"] == "running":
-            st.info("Document ingestion in progress...")
+            st.info("Document ingestion in progress…")
             messages = status.get("messages", [])
             if messages:
-                with st.expander("Progress log", expanded=True):
-                    for line in messages[-20:]:
-                        st.text(f"  {line}")
+                _task_progress(messages, "doc_prog")
             else:
-                st.text("  Starting...")
-            time.sleep(2)
-            st.rerun()
+                st.caption("Starting…")
+            if st.button("Cancel", key="doc_cancel"):
+                st.session_state.doc_task_id = None
+                st.rerun()
+            needs_rerun = True
         elif status["status"] == "done":
             result = status.get("result", {})
             st.success("Document ingestion complete!")
             st.metric("Chunks stored", result.get("chunk_count", 0))
             st.caption(f"File: **{result.get('file_name', '')}**")
-            st.caption(f"Upload source ID: `{result.get('upload_source_id', '')}`")
+            messages = status.get("messages", [])
+            if messages:
+                _task_progress(messages, "doc_done_prog")
             if st.button("Upload another document", key="doc_reset"):
                 st.session_state.doc_task_id = None
                 st.rerun()
@@ -529,37 +534,36 @@ def render_admin():
             st.error(f"Ingestion failed: {status.get('error', 'Unknown error')}")
             messages = status.get("messages", [])
             if messages:
-                with st.expander("Error log"):
-                    for line in messages:
-                        st.text(f"  {line}")
+                _task_progress(messages, "doc_err_prog")
             if st.button("Try again", key="doc_retry"):
                 st.session_state.doc_task_id = None
                 st.rerun()
     else:
         doc_file = st.file_uploader("Choose PDF or text file", type=["pdf", "txt", "md"], key="doc_uploader")
         if doc_file is not None:
-            if st.button("Ingest Document", use_container_width=False, key="doc_btn"):
-                with st.spinner("Uploading..."):
-                    resp = api_start_doc_ingest(
-                        doc_file.read(), doc_file.name, st.session_state.token
-                    )
+            if st.button("Ingest Document", key="doc_btn"):
+                with st.spinner("Uploading…"):
+                    resp = api_start_doc_ingest(doc_file.read(), doc_file.name, st.session_state.token)
                 if resp and "task_id" in resp:
                     st.session_state.doc_task_id = resp["task_id"]
                     st.rerun()
                 else:
-                    err = resp.get("error", "Unknown error") if resp else "No response"
-                    st.error(f"Failed to start ingestion: {err}")
+                    st.error(resp.get("error", "Unknown error") if resp else "No response")
 
     st.divider()
 
     # ── Session cookie refresh reminder ──────────────────────────────────────
     st.subheader("Patreon Session Cookie")
     st.caption(
-        "The `PATREON_SESSION_ID` in `.env` expires every ~2 weeks. "
-        "To refresh: log into Patreon in Chrome → DevTools → Application → Cookies → "
-        "copy the `session_id` value → update `.env` → restart the server."
+        "The `PATREON_SESSION_ID` expires every ~2 weeks. "
+        "Refresh: log into Patreon → DevTools → Application → Cookies → copy `session_id` → update Railway env var."
     )
     st.code("PATREON_SESSION_ID=your_new_session_id_here", language="bash")
+
+    # Auto-refresh fired AFTER all sections are rendered
+    if needs_rerun:
+        time.sleep(2)
+        st.rerun()
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
