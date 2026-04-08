@@ -1,7 +1,15 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+
+    @field_validator('database_url', mode='after')
+    def ensure_asyncpg_dialect(cls, v):
+        if v and v.startswith('postgresql://'):
+            return v.replace('postgresql://', 'postgresql+asyncpg://', 1)
+        return v
+
     # App
     app_name: str = "Sid Sloth"
     debug: bool = False
