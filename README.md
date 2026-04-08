@@ -77,7 +77,7 @@ Required env vars:
 | `ANON_EXTRA_RULES` | JSON array of sensitive anonymization rules |
 | `PATREON_SESSION_ID` | Browser session cookie for Patreon ingestion |
 | `PATREON_CAMPAIGN_ID` | Numeric campaign ID |
-| `IDENTITY_STRIP_PATTERNS` | JSON array of regex patterns to strip from posts |
+| `IDENTITY_STRIP_PATTERNS` | JSON array of regex patterns to strip |
 | `POLITICAL_SIGNALS` | JSON array of off-topic keyword signals |
 
 ### 3. Start services
