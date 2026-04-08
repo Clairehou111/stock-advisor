@@ -1,0 +1,49 @@
+[project]
+name = "stock-advisor"
+version = "0.1.0"
+description = "AI stock decision-making assistant powered by Sid Sloth's methodology"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "pgvector>=0.3.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "python-multipart>=0.0.18",
+    "openpyxl>=3.1.0",
+    "httpx[socks]>=0.28.0",
+    "google-genai>=1.0.0",
+    "openai>=1.60.0",
+    "yfinance>=0.2.0",
+    "boto3>=1.35.0",
+    "bcrypt>=4.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "websockets>=14.0",
+    "streamlit>=1.40.0",
+    "pypdf>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "httpx[socks]>=0.28.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+[tool.setuptools.packages.find]
+include = ["app*"]
