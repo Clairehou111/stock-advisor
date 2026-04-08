@@ -14,7 +14,8 @@ import time
 import httpx
 import streamlit as st
 
-API_BASE = "http://localhost:8000/api"
+import os
+API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000/api")
 
 st.set_page_config(
     page_title="Sid Sloth",
