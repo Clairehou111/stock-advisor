@@ -150,25 +150,36 @@ def _has_financial_content(text: str) -> bool:
     return any(kw in t for kw in keywords)
 
 
-async def _rephrase(text: str) -> str:
-    if not text.strip() or not settings.deepseek_api_key:
-        return text
-    try:
-        async with httpx.AsyncClient(timeout=20.0, trust_env=True) as client:
+async def _deepseek_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str:
+    """Shared DeepSeek call with retry. Raises on exhaustion — callers must handle."""
+    from app.llm.retry import retry
+
+    async def _call():
+        async with httpx.AsyncClient(timeout=30.0, trust_env=True) as client:
             resp = await client.post(
                 "https://api.deepseek.com/chat/completions",
                 headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
                 json={
                     "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": _REPHRASE_PROMPT.format(text=text)}],
-                    "max_tokens": 300,
-                    "temperature": 0.3,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
                 },
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
+
+    return await retry(_call, label="DeepSeek/ingestion")
+
+
+async def _rephrase(text: str) -> str:
+    if not text.strip() or not settings.deepseek_api_key:
+        return text
+    try:
+        result = await _deepseek_call(_REPHRASE_PROMPT.format(text=text), max_tokens=300, temperature=0.3)
+        return result or text
     except Exception as e:
-        logger.warning("Rephrase failed: %s", e)
+        logger.warning("Rephrase failed after retries: %s", e)
         return text
 
 
@@ -177,29 +188,22 @@ async def _extract_signals_chunk(text: str) -> list[dict]:
     if not settings.deepseek_api_key or not text.strip():
         return []
     try:
-        async with httpx.AsyncClient(timeout=20.0, trust_env=True) as client:
-            resp = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": _SIGNAL_EXTRACTION_PROMPT.format(text=text[:6000])}],
-                    "max_tokens": 600,
-                    "temperature": 0.1,
-                },
-            )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Strip markdown fences
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            raw = raw.strip()
-            if not raw or raw == "[]":
-                return []
-            # Try to salvage truncated JSON arrays
-            if raw.startswith("[") and not raw.endswith("]"):
-                raw = raw.rsplit("}", 1)[0] + "}]"
-            return json.loads(raw)
+        raw = await _deepseek_call(
+            _SIGNAL_EXTRACTION_PROMPT.format(text=text[:6000]),
+            max_tokens=600, temperature=0.1,
+        )
+        if not raw:
+            return []
+        # Strip markdown fences
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+        if not raw or raw == "[]":
+            return []
+        # Try to salvage truncated JSON arrays
+        if raw.startswith("[") and not raw.endswith("]"):
+            raw = raw.rsplit("}", 1)[0] + "}]"
+        return json.loads(raw)
     except Exception as e:
         logger.warning("Signal extraction chunk failed: %s", e)
         return []
@@ -227,8 +231,8 @@ async def _extract_signals(
     return all_signals
 
 
-def _analyze_chart_sync(image_bytes: bytes) -> str:
-    """Send image bytes to Gemini Vision for chart analysis."""
+def _analyze_chart_once(image_bytes: bytes) -> str:
+    """Single attempt at Gemini Vision chart analysis."""
     from google import genai
     from google.genai import types
 
@@ -250,7 +254,13 @@ def _analyze_chart_sync(image_bytes: bytes) -> str:
 
 
 async def _analyze_chart(image_bytes: bytes) -> str:
-    return await asyncio.to_thread(_analyze_chart_sync, image_bytes)
+    """Chart analysis with retry."""
+    from app.llm.retry import retry
+    try:
+        return await retry(_analyze_chart_once, image_bytes, label="Gemini Vision", sync=True)
+    except Exception as e:
+        logger.warning("Chart analysis failed after retries: %s", e)
+        return "Chart analysis unavailable — service temporarily overloaded."
 
 
 async def _download_image(url: str) -> bytes | None:

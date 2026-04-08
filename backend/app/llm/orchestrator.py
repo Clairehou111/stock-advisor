@@ -1,15 +1,9 @@
 """
 LLM Orchestrator — routes requests to the appropriate model.
 
-Chat (all queries):
-  Primary:  Qwen3 235B A22B via OpenRouter
-  Fallback: DeepSeek V3
-
-Extraction tasks (metadata, chart analysis):
-  Gemini 2.5 Flash (unchanged)
-
-Rephrasing / signal extraction:
-  DeepSeek V3 (unchanged)
+Every external call retries on transient errors (503, 429, timeout).
+Every tier has a fallback chain: Qwen3 → DeepSeek, Gemini → DeepSeek.
+DeepSeek (final fallback) retries but returns a friendly error on exhaustion.
 """
 
 from __future__ import annotations
@@ -21,6 +15,7 @@ from enum import Enum
 import httpx
 
 from app.config import settings
+from app.llm.retry import retry
 
 logger = logging.getLogger(__name__)
 
@@ -55,24 +50,18 @@ def select_model(query: str, is_analysis: bool = True, is_degraded: bool = False
     """Route to the appropriate model based on context."""
     if is_degraded:
         return ModelTier.DEEPSEEK_V3
-
     return ModelTier.QWEN3
 
 
 THINKING_BUDGET = 10000  # tokens reserved for Qwen3 chain-of-thought
 
 
-async def call_openrouter(
+async def _call_openrouter_raw(
     messages: list[dict],
     model: str = QWEN3_MODEL,
     max_tokens: int = 600,
 ) -> LLMResponse:
-    """Call OpenRouter API (OpenAI-compatible). Works for Claude and Qwen3.
-
-    For Qwen3: thinking tokens are separate from output tokens.
-    max_tokens covers thinking + output, so we add THINKING_BUDGET on top
-    of the requested output budget.
-    """
+    """Single attempt at calling OpenRouter."""
     api_key = settings.openrouter_api_key
     if not api_key:
         return LLMResponse(content="[OpenRouter API key not configured]", model_used=model)
@@ -82,8 +71,6 @@ async def call_openrouter(
         "messages": messages,
         "max_tokens": max_tokens + THINKING_BUDGET,
         "temperature": 0.7,
-        # Enable Qwen3 extended reasoning with a capped budget so the model
-        # reasons deeply without burning unbounded tokens.
         "thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET},
     }
 
@@ -112,11 +99,23 @@ async def call_openrouter(
     )
 
 
-async def call_gemini_flash(
+async def call_openrouter(
+    messages: list[dict],
+    model: str = QWEN3_MODEL,
+    max_tokens: int = 600,
+) -> LLMResponse:
+    """Call OpenRouter with retry."""
+    return await retry(
+        _call_openrouter_raw, messages, model=model, max_tokens=max_tokens,
+        label="OpenRouter/Qwen3",
+    )
+
+
+async def _call_gemini_flash_raw(
     messages: list[dict],
     max_tokens: int = 600,
 ) -> LLMResponse:
-    """Call Gemini 2.5 Flash — used for extraction tasks only."""
+    """Single attempt at calling Gemini Flash."""
     api_key = settings.gemini_api_key
     model = "gemini-2.5-flash"
     if not api_key:
@@ -167,11 +166,22 @@ async def call_gemini_flash(
     )
 
 
-async def call_deepseek(
+async def call_gemini_flash(
     messages: list[dict],
     max_tokens: int = 600,
 ) -> LLMResponse:
-    """Call DeepSeek API — economy tier and rephrase/extraction tasks."""
+    """Call Gemini Flash with retry."""
+    return await retry(
+        _call_gemini_flash_raw, messages, max_tokens=max_tokens,
+        label="Gemini Flash",
+    )
+
+
+async def _call_deepseek_raw(
+    messages: list[dict],
+    max_tokens: int = 600,
+) -> LLMResponse:
+    """Single attempt at calling DeepSeek."""
     api_key = settings.deepseek_api_key
     if not api_key:
         return LLMResponse(content="[DeepSeek API key not configured]", model_used="deepseek-chat")
@@ -202,6 +212,24 @@ async def call_deepseek(
     )
 
 
+async def call_deepseek(
+    messages: list[dict],
+    max_tokens: int = 600,
+) -> LLMResponse:
+    """Call DeepSeek with retry. As final fallback, returns error message on exhaustion."""
+    try:
+        return await retry(
+            _call_deepseek_raw, messages, max_tokens=max_tokens,
+            label="DeepSeek",
+        )
+    except Exception as e:
+        logger.error("DeepSeek exhausted all retries: %s", e)
+        return LLMResponse(
+            content="I'm sorry, all AI services are temporarily unavailable. Please try again in a few minutes.",
+            model_used="none",
+        )
+
+
 async def chat(
     messages: list[dict],
     model_tier: ModelTier | None = None,
@@ -211,9 +239,9 @@ async def chat(
     max_tokens: int = 600,
 ) -> LLMResponse:
     """
-    Route a chat request:
-      Primary:  Qwen3 235B A22B (OpenRouter, with extended thinking)
-      Fallback: DeepSeek V3 (economy mode or on Qwen3 failure)
+    Route a chat request with retry + fallback:
+      Qwen3 (retry) → DeepSeek (retry) → friendly error
+      Gemini (retry) → DeepSeek (retry) → friendly error
     """
     if model_tier is None:
         model_tier = select_model(query, is_analysis=is_analysis, is_degraded=is_degraded)
@@ -221,14 +249,13 @@ async def chat(
     logger.info("Routing to %s (analysis=%s, degraded=%s)", model_tier.value, is_analysis, is_degraded)
 
     if model_tier == ModelTier.QWEN3:
-        # Primary: Qwen3 235B A22B
         try:
             result = await call_openrouter(messages, model=QWEN3_MODEL, max_tokens=max_tokens)
             if result.content:
                 return result
             logger.warning("Qwen3 returned empty response, falling back to DeepSeek")
         except Exception as e:
-            logger.warning("Qwen3 failed (%s: %s), falling back to DeepSeek", type(e).__name__, e)
+            logger.warning("Qwen3 failed after retries (%s: %s), falling back to DeepSeek", type(e).__name__, e)
 
         return await call_deepseek(messages, max_tokens=max_tokens)
 
@@ -238,7 +265,7 @@ async def chat(
             if result.content:
                 return result
         except Exception as e:
-            logger.warning("Gemini Flash failed (%s: %s), falling back to DeepSeek", type(e).__name__, e)
+            logger.warning("Gemini Flash failed after retries (%s: %s), falling back to DeepSeek", type(e).__name__, e)
         return await call_deepseek(messages, max_tokens=max_tokens)
 
     else:

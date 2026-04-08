@@ -72,8 +72,8 @@ def _compute_confidence(times_stated: int) -> float:
     return min(0.95, 0.3 + 0.15 * math.log(max(1, times_stated)))
 
 
-def _call_flash_sync(prompt: str) -> str:
-    """Synchronous Gemini Flash call via google-genai SDK (proxy-safe)."""
+def _call_flash_once(prompt: str) -> str:
+    """Single attempt at Gemini Flash."""
     from google import genai
     from google.genai import types
 
@@ -94,8 +94,14 @@ def _call_flash_sync(prompt: str) -> str:
     return text
 
 
-async def _call_deepseek(prompt: str) -> str:
-    """DeepSeek fallback for when Gemini is unavailable."""
+async def _call_flash_with_retry(prompt: str) -> str:
+    """Gemini Flash with retry."""
+    from app.llm.retry import retry
+    return await retry(_call_flash_once, prompt, label="Gemini Flash/distill", sync=True)
+
+
+async def _call_deepseek_once(prompt: str) -> str:
+    """Single attempt at DeepSeek."""
     import httpx
     async with httpx.AsyncClient(timeout=30.0, trust_env=True) as client:
         resp = await client.post(
@@ -116,13 +122,19 @@ async def _call_deepseek(prompt: str) -> str:
         return text
 
 
+async def _call_deepseek(prompt: str) -> str:
+    """DeepSeek with retry."""
+    from app.llm.retry import retry
+    return await retry(_call_deepseek_once, prompt, label="DeepSeek/distill")
+
+
 async def _call_flash(prompt: str) -> str:
-    """Call Gemini Flash, fall back to DeepSeek on 503 or any error."""
+    """Call Gemini Flash (retry) → fall back to DeepSeek (retry) → raise."""
     if settings.gemini_api_key:
         try:
-            return await asyncio.to_thread(_call_flash_sync, prompt)
+            return await _call_flash_with_retry(prompt)
         except Exception as e:
-            logger.warning("Gemini Flash failed (%s), falling back to DeepSeek", e)
+            logger.warning("Gemini Flash exhausted retries (%s), falling back to DeepSeek", e)
 
     if settings.deepseek_api_key:
         return await _call_deepseek(prompt)

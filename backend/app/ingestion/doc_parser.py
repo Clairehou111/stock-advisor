@@ -43,11 +43,14 @@ Original:
 
 
 async def _rephrase(text: str) -> str:
-    """Rephrase text to remove personal voice. Returns original on failure."""
+    """Rephrase text to remove personal voice. Retries on transient errors. Returns original on failure."""
+    from app.llm.retry import retry
+
     if not text.strip() or not settings.deepseek_api_key:
         return text
-    try:
-        async with httpx.AsyncClient(timeout=25.0, trust_env=True) as client:
+
+    async def _call():
+        async with httpx.AsyncClient(timeout=30.0, trust_env=True) as client:
             resp = await client.post(
                 "https://api.deepseek.com/chat/completions",
                 headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
@@ -60,8 +63,11 @@ async def _rephrase(text: str) -> str:
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
+
+    try:
+        return await retry(_call, label="DeepSeek/doc-rephrase")
     except Exception as e:
-        logger.warning("Rephrase failed: %s", e)
+        logger.warning("Rephrase failed after retries: %s", e)
         return text
 
 # Approximate tokens per word (English)
@@ -182,8 +188,8 @@ def chunk_text(text: str) -> list[str]:
     return merged
 
 
-def _extract_metadata_sync(chunk_text_str: str) -> dict:
-    """Synchronous metadata extraction via google-genai SDK (proxy-safe)."""
+def _extract_metadata_once(chunk_text_str: str) -> dict:
+    """Single attempt at metadata extraction via Gemini Flash."""
     from google import genai
     from google.genai import types
 
@@ -208,6 +214,12 @@ def _extract_metadata_sync(chunk_text_str: str) -> dict:
     return json.loads(text)
 
 
+async def _extract_metadata_with_retry(chunk_text_str: str) -> dict:
+    """Metadata extraction with retry."""
+    from app.llm.retry import retry
+    return await retry(_extract_metadata_once, chunk_text_str, label="Gemini/metadata", sync=True)
+
+
 async def extract_metadata(chunk_text_str: str) -> dict:
     """Extract metadata from a chunk using Gemini Flash."""
     if not settings.gemini_api_key:
@@ -215,7 +227,7 @@ async def extract_metadata(chunk_text_str: str) -> dict:
         return _default_metadata()
 
     try:
-        return await asyncio.to_thread(_extract_metadata_sync, chunk_text_str)
+        return await _extract_metadata_with_retry(chunk_text_str)
     except Exception:
         logger.exception("Metadata extraction failed, using defaults")
         return _default_metadata()

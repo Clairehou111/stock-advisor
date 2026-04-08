@@ -47,15 +47,17 @@ Original:
 
 
 async def _rephrase(text: str) -> str:
-    """Rephrase text via DeepSeek to remove distinctive authorial voice."""
+    """Rephrase text via DeepSeek with retry. Returns original on failure."""
+    from app.llm.retry import retry
+
     if not text or not text.strip():
         return text
     api_key = settings.deepseek_api_key
     if not api_key:
-        return text  # no-op if key missing
+        return text
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
+    async def _call():
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             resp = await client.post(
                 "https://api.deepseek.com/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -68,8 +70,11 @@ async def _rephrase(text: str) -> str:
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
+
+    try:
+        return await retry(_call, label="DeepSeek/excel-rephrase")
     except Exception as e:
-        logger.warning("Rephrase failed (%s), using original", e)
+        logger.warning("Rephrase failed after retries (%s), using original", e)
         return text
 
 
