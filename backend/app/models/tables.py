@@ -148,7 +148,7 @@ class AnalystChunk(Base):
     ticker: Mapped[str | None] = mapped_column(String(20), index=True)
     chunk_type: Mapped[str] = mapped_column(String(50))  # philosophy / prediction / commentary / egf_explanation
     content_text: Mapped[str] = mapped_column(Text)
-    embedding = mapped_column(Vector(768), nullable=True)  # Gemini text-embedding-004 = 768 dims
+    embedding = mapped_column(Vector(1024), nullable=True)
     temporal_scope: Mapped[str | None] = mapped_column(String(20))  # short_term / long_term / general
     metadata_json: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -278,6 +278,7 @@ class IngestTask(Base):
     __tablename__ = "ingest_tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)          # UUID string
+    task_type: Mapped[str] = mapped_column(String(20), default="patreon")  # patreon / excel / doc
     status: Mapped[str] = mapped_column(String(20), default="running")     # running / done / error
     messages: Mapped[list] = mapped_column(JSONB, default=list)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

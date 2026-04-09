@@ -29,6 +29,20 @@ async def lifespan(app: FastAPI):
         await conn.execute(
             __import__("sqlalchemy").text("DROP TABLE IF EXISTS price_cache")
         )
+        # Add task_type column to ingest_tasks if missing
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE ingest_tasks ADD COLUMN IF NOT EXISTS task_type VARCHAR(20) DEFAULT 'patreon'"
+            )
+        )
+        # Migrate embedding column from 768 to 1024 dims (one-time, safe on fresh deploy)
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "DO $$ BEGIN "
+                "ALTER TABLE analyst_chunks ALTER COLUMN embedding TYPE vector(1024) USING NULL; "
+                "EXCEPTION WHEN undefined_table THEN NULL; END $$"
+            )
+        )
         await conn.run_sync(Base.metadata.create_all)
     # Mark any tasks that were "running" when the server last died as errors
     from sqlalchemy import update as sa_update

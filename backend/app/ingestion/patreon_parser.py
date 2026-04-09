@@ -594,85 +594,15 @@ async def ingest_patreon_post(
             await _log(f"  Skipping '{sec_title}' (already done)")
             continue
 
-        # Group nodes: accumulate text until we hit an image, then flush as chunk
-        text_buffer: list[str] = []
-        chunk_parts: list[str] = []
-
-        async def flush_chunk(extra: str = "") -> None:
-            nonlocal created_chunks
-            body = "\n\n".join(text_buffer)
-            if extra:
-                body = (body + "\n\n" + extra).strip()
-            if not body.strip():
-                return
-
-            # Rephrase
-            rephrased = await _rephrase(body)
-            await asyncio.sleep(0.3)
-
-            # Metadata extraction (reuse existing function)
-            from app.ingestion.doc_parser import extract_metadata
-            meta = await extract_metadata(rephrased)
-
-            tickers_meta = meta.get("tickers_mentioned") or []
-            chunk = AnalystChunk(
-                upload_source_id=upload.id,
-                ticker=tickers_meta[0] if tickers_meta else None,
-                chunk_type=meta.get("chunk_type", "commentary"),
-                content_text=rephrased,
-                temporal_scope=meta.get("temporal_scope", "general"),
-                metadata_json={**meta, "section": sec_title, "post_id": post_id},
-                outlook_horizon=meta.get("outlook_horizon"),
-                publish_date=publish_date,
-                tickers_mentioned=meta.get("tickers_mentioned", []),
-                thesis_direction=meta.get("thesis_direction"),
-                retrieval_count=0,
-                is_stale=False,
+        try:
+            await _process_section(
+                sec_title, sec_nodes, post_id, publish_date, upload,
+                created_chunks, db, _log, _download_image, _analyze_chart,
             )
-            created_chunks.append(chunk)
-            db.add(chunk)
-            text_buffer.clear()
-
-        for node in sec_nodes:
-            if node["type"] == "text":
-                text_buffer.append(node["text"])
-            elif node["type"] == "image":
-                image_url = node["attrs"].get("src", "")
-                media_id = node["attrs"].get("media_id", str(uuid.uuid4()))
-                if not image_url:
-                    continue
-
-                # Download image
-                image_bytes = await _download_image(image_url)
-                chart_desc = ""
-                r2_image_key = ""
-
-                if image_bytes:
-                    image_count += 1
-                    r2_image_key = f"patreon/posts/{post_id}/images/{media_id}.jpg"
-                    # Upload to R2 only if not already there
-                    try:
-                        already_exists = await asyncio.to_thread(_r2_key_exists, r2_image_key)
-                        if not already_exists:
-                            await asyncio.to_thread(_upload_to_r2, image_bytes, r2_image_key)
-                        else:
-                            logger.debug("R2 image already exists, skipping upload: %s", r2_image_key)
-                    except Exception as e:
-                        logger.warning("R2 upload failed: %s", e)
-
-                    # Analyze chart
-                    await _log(f"  Analyzing chart {image_count} (media_id={media_id})...")
-                    chart_desc = await _analyze_chart(image_bytes)
-                    await asyncio.sleep(1.0)  # Gemini rate limit
-
-                # Flush current text buffer + chart description as one chunk
-                chart_section = f"[Chart Analysis]\n{chart_desc}" if chart_desc else ""
-                if r2_image_key:
-                    chart_section += f"\n[Image stored at: {r2_image_key}]"
-                await flush_chunk(chart_section)
-
-        # Flush remaining text at end of section
-        await flush_chunk()
+            image_count += sum(1 for n in sec_nodes if n["type"] == "image")
+        except Exception as e:
+            logger.exception("Section '%s' failed, skipping", sec_title)
+            await _log(f"  WARNING: Section '{sec_title}' failed ({e}), skipping")
 
     # 7. Embed all chunks in batches
     await _log(f"Embedding {len(created_chunks)} chunks...")

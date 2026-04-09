@@ -20,9 +20,9 @@ from app.llm.retry import retry
 
 logger = logging.getLogger(__name__)
 
-MODEL = "models/gemini-embedding-001"
-OPENROUTER_MODEL = "google/gemini-embedding-exp-03-07"
-DIMENSIONS = 768
+MODEL = "models/gemini-embedding-2-preview"
+OPENROUTER_MODEL = "qwen/qwen3-embedding-4b"
+DIMENSIONS = 1024
 BATCH_LIMIT = 100
 
 

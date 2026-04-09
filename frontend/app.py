@@ -46,13 +46,6 @@ def _save_page_to_url(page: str) -> None:
 def _load_page_from_url() -> str:
     return st.query_params.get("p") or "chat"
 
-def _save_task_to_url(task_id: str) -> None:
-    st.query_params["task"] = task_id
-
-def _clear_task_from_url() -> None:
-    if "task" in st.query_params:
-        del st.query_params["task"]
-
 def _decode_jwt_is_admin(token: str) -> bool:
     """Decode JWT payload (no validation) to extract is_admin flag."""
     try:
@@ -80,15 +73,15 @@ if "messages" not in st.session_state:
 if "page" not in st.session_state:
     # Restore page from URL so admin page survives refresh
     st.session_state.page = _load_page_from_url() if st.session_state.token else "chat"
-# Admin ingestion task tracking — load from URL so it survives page refresh
+# Admin ingestion task tracking — restored from backend on page load
 if "patreon_task_id" not in st.session_state:
-    st.session_state.patreon_task_id = st.query_params.get("task") or None
-if "patreon_task_done" not in st.session_state:
-    st.session_state.patreon_task_done = None
+    st.session_state.patreon_task_id = None
 if "excel_task_id" not in st.session_state:
     st.session_state.excel_task_id = None
 if "doc_task_id" not in st.session_state:
     st.session_state.doc_task_id = None
+if "tasks_restored" not in st.session_state:
+    st.session_state.tasks_restored = False
 
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
@@ -159,6 +152,21 @@ def api_get_task_status(task_id: str, token: str) -> dict | None:
         return None
     except Exception:
         return None
+
+
+def api_get_active_tasks(token: str) -> list[dict]:
+    """Fetch all running/recent tasks from backend."""
+    try:
+        with httpx.Client(trust_env=False, timeout=10.0) as client:
+            resp = client.get(
+                f"{API_BASE}/admin/ingest/active",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
 
 
 def api_start_excel_ingest(file_bytes: bytes, filename: str, token: str) -> dict | None:
@@ -335,7 +343,31 @@ def _task_progress(messages: list[str], key: str) -> None:
             st.text(f"  {line}")
 
 
+def _restore_active_tasks():
+    """On first load, query backend for any running/recent tasks and restore session state."""
+    if st.session_state.tasks_restored:
+        return
+    st.session_state.tasks_restored = True
+    token = st.session_state.token
+    if not token:
+        return
+    active = api_get_active_tasks(token)
+    for t in active:
+        if t["status"] != "running":
+            continue
+        tid = t["task_id"]
+        tt = t.get("task_type", "patreon")
+        if tt == "patreon" and not st.session_state.patreon_task_id:
+            st.session_state.patreon_task_id = tid
+        elif tt == "excel" and not st.session_state.excel_task_id:
+            st.session_state.excel_task_id = tid
+        elif tt == "doc" and not st.session_state.doc_task_id:
+            st.session_state.doc_task_id = tid
+
+
 def render_admin():
+    _restore_active_tasks()
+
     col1, col2, col3 = st.columns([5, 1, 1])
     with col1:
         st.title("⚙️ Admin — Ingestion")
@@ -372,7 +404,7 @@ def render_admin():
             st.warning("Task not found — server may have restarted.")
             if st.button("Dismiss", key="dismiss_lost"):
                 st.session_state.patreon_task_id = None
-                _clear_task_from_url()
+
                 st.rerun()
         elif status["status"] == "running":
             st.info("Ingestion in progress…")
@@ -383,7 +415,7 @@ def render_admin():
                 st.caption("Starting…")
             if st.button("Cancel", key="patreon_cancel"):
                 st.session_state.patreon_task_id = None
-                _clear_task_from_url()
+
                 st.rerun()
             needs_rerun = True
         elif status["status"] == "done":
@@ -399,7 +431,7 @@ def render_admin():
                 _task_progress(messages, "patreon_done_prog")
             if st.button("Ingest another post", key="patreon_reset"):
                 st.session_state.patreon_task_id = None
-                _clear_task_from_url()
+
                 st.rerun()
         elif status["status"] == "error":
             st.error(f"Ingestion failed: {status.get('error', 'Unknown error')}")
@@ -408,7 +440,7 @@ def render_admin():
                 _task_progress(messages, "patreon_err_prog")
             if st.button("Try again", key="patreon_retry"):
                 st.session_state.patreon_task_id = None
-                _clear_task_from_url()
+
                 st.rerun()
     else:
         with st.form("patreon_ingest_form"):
@@ -431,7 +463,7 @@ def render_admin():
                     st.error(resp.get("error", "Failed to start ingestion") if resp else "No response")
                 else:
                     st.session_state.patreon_task_id = resp["task_id"]
-                    _save_task_to_url(resp["task_id"])
+                    pass  # task_id saved to session_state above
                     st.rerun()
 
     st.divider()

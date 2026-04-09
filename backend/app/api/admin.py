@@ -131,11 +131,35 @@ async def ingest_patreon(
 
     task_id = str(uuid.uuid4())
     async with async_session() as db:
-        db.add(IngestTask(id=task_id, status="running", messages=[], result=None, error=None))
+        db.add(IngestTask(id=task_id, task_type="patreon", status="running", messages=[], result=None, error=None))
         await db.commit()
 
     asyncio.create_task(_run_patreon_ingest(task_id, post_id, force=request.force))
     return PatreonTaskResponse(task_id=task_id)
+
+
+@router.get("/ingest/active")
+async def get_active_tasks(
+    _admin: User = Depends(_require_admin),
+):
+    """Return all running or recently finished tasks (last 24h). Called on page load."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    async with async_session() as db:
+        result = await db.execute(
+            select(IngestTask).where(
+                (IngestTask.status == "running") | (IngestTask.created_at >= cutoff)
+            ).order_by(IngestTask.created_at.desc())
+        )
+        tasks = result.scalars().all()
+    return [
+        {
+            "task_id": t.id,
+            "task_type": t.task_type,
+            "status": t.status,
+        }
+        for t in tasks
+    ]
 
 
 @router.get("/ingest/status/{task_id}", response_model=TaskStatusResponse)
@@ -278,7 +302,7 @@ async def ingest_excel(
     file_bytes = await file.read()
     task_id = str(uuid.uuid4())
     async with async_session() as db:
-        db.add(IngestTask(id=task_id, status="running", messages=[], result=None, error=None))
+        db.add(IngestTask(id=task_id, task_type="excel", status="running", messages=[], result=None, error=None))
         await db.commit()
 
     asyncio.create_task(_run_excel_ingest(task_id, file_bytes, file.filename))
@@ -301,7 +325,7 @@ async def ingest_doc(
     file_bytes = await file.read()
     task_id = str(uuid.uuid4())
     async with async_session() as db:
-        db.add(IngestTask(id=task_id, status="running", messages=[], result=None, error=None))
+        db.add(IngestTask(id=task_id, task_type="doc", status="running", messages=[], result=None, error=None))
         await db.commit()
 
     asyncio.create_task(_run_doc_ingest(task_id, file_bytes, fname))

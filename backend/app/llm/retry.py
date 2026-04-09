@@ -8,7 +8,7 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE = ("503", "429", "unavailable", "overloaded", "timeout", "rate_limit", "rate limit", "capacity")
+_RETRYABLE = ("503", "429", "unavailable", "overloaded", "timeout", "rate_limit", "rate limit", "capacity", "high demand", "resource exhausted", "quota")
 MAX_RETRIES = 3
 BASE_DELAY = 2.0
 
