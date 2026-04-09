@@ -120,7 +120,7 @@ class StockPrediction(Base, TimestampMixin):
 
     # Fundamentals & trend
     fundamentals: Mapped[float | None] = mapped_column(Numeric(4, 1))
-    trend_status: Mapped[str | None] = mapped_column(String(255))
+    trend_status: Mapped[str | None] = mapped_column(Text)
     prob_new_ath: Mapped[float | None] = mapped_column(Numeric(4, 2))
 
     # Strategy

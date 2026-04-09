@@ -43,6 +43,14 @@ async def lifespan(app: FastAPI):
                 "EXCEPTION WHEN undefined_table THEN NULL; END $$"
             )
         )
+        # Widen trend_status from VARCHAR(255) to TEXT (holds LLM-generated market commentary)
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "DO $$ BEGIN "
+                "ALTER TABLE stock_predictions ALTER COLUMN trend_status TYPE TEXT; "
+                "EXCEPTION WHEN undefined_table THEN NULL; END $$"
+            )
+        )
         await conn.run_sync(Base.metadata.create_all)
     # Mark any tasks that were "running" when the server last died as errors
     from sqlalchemy import update as sa_update
