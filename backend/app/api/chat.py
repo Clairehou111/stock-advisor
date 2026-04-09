@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -178,8 +179,22 @@ class ChatResponse(BaseModel):
 
 
 def _query_ngrams(query: str) -> list[str]:
-    """Extract 1-, 2-, and 3-word lowercase n-grams from query."""
-    words = re.sub(r"[^\w\s&]", " ", query.lower()).split()
+    """Extract 1-, 2-, and 3-word lowercase n-grams from query.
+
+    Also extracts embedded ASCII tokens from mixed-script tokens (e.g. "告诉我SP的价格" → "sp").
+    This handles Chinese/Japanese/Korean text that contains Latin ticker symbols without spaces.
+    """
+    cleaned = re.sub(r"[^\w\s&]", " ", query.lower())
+    words = cleaned.split()
+
+    # For any token that mixes scripts, also extract pure-ASCII sub-tokens
+    extra: list[str] = []
+    for w in words:
+        if re.search(r"[^\x00-\x7f]", w):  # contains non-ASCII (CJK etc.)
+            ascii_parts = re.findall(r"[a-z0-9&][a-z0-9&]*", w)
+            extra.extend(ascii_parts)
+    words = words + extra
+
     ngrams = []
     for i, w in enumerate(words):
         ngrams.append(w)
@@ -306,9 +321,16 @@ async def _extract_entities(
                     index_map[value] = _INDEX_DISPLAY.get(value, value)
 
             if new_entries:
-                db.add_all(new_entries)
-                # flush async so saves don't block the response
-                await db.flush()
+                # ON CONFLICT DO NOTHING — handles race conditions and seeded aliases
+                # (e.g. "sp" seeded at startup but not matched via n-gram in Chinese text)
+                await db.execute(
+                    pg_insert(EntityAlias)
+                    .values([
+                        {"alias": e.alias, "resolved_type": e.resolved_type, "resolved_value": e.resolved_value}
+                        for e in new_entries
+                    ])
+                    .on_conflict_do_nothing(index_elements=["alias"])
+                )
                 logger.info("Saved %d new entity aliases: %s", len(new_entries),
                             [e.alias for e in new_entries])
 
