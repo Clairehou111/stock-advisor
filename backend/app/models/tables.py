@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -164,6 +165,14 @@ class AnalystChunk(Base):
     avg_relevance: Mapped[float | None] = mapped_column(Numeric(4, 3))
     last_retrieved: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_stale: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (
+        # Channel 1: ticker-tagged fetch, filtered by staleness + sorted by date
+        Index("ix_analyst_chunks_ticker_stale_date", "ticker", "is_stale", "publish_date"),
+        # Channel 3: philosophy semantic search on chunks with no ticker
+        Index("ix_analyst_chunks_null_ticker_stale", "is_stale",
+              postgresql_where=text("ticker IS NULL")),
+    )
 
 
 # ── Principle Corpus ───────────────────────────────────────────────────────────

@@ -48,7 +48,7 @@ from app.models.tables import (
 from app.core.security import get_current_user
 from app.services.earnings_service import format_earnings_notice, get_upcoming_earnings
 from app.services.embedding_service import embed_text
-from app.services.price_service import get_price
+from app.services.price_service import get_price, get_ticker_meta
 from app.services.rate_limiter import RateLimiter
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -371,57 +371,149 @@ async def _get_principles(db: AsyncSession) -> list[str]:
     return [row[0] for row in result.all()]
 
 
+_CHUNK_TOKEN_BUDGET = 3000  # approximate token budget for all retrieved chunks
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English."""
+    return len(text) // 4
+
+
+def _format_chunk_with_meta(chunk: AnalystChunk) -> str:
+    """Prepend temporal metadata so the LLM can reason about recency."""
+    parts = []
+    if chunk.publish_date:
+        parts.append(str(chunk.publish_date))
+    if chunk.temporal_scope:
+        parts.append(chunk.temporal_scope)
+    if chunk.thesis_direction:
+        parts.append(chunk.thesis_direction)
+    prefix = f"[{' | '.join(parts)}] " if parts else ""
+    return prefix + chunk.content_text
+
+
 async def _get_relevant_chunks(
     query: str,
     db: AsyncSession,
     tickers: list[str] | None = None,
-    limit: int = 5,
+    uncovered_tickers: list[str] | None = None,
+    limit: int = 10,
 ) -> list[tuple[AnalystChunk, float]]:
-    """Retrieve relevant analyst chunks via pgvector cosine similarity.
+    """Three-channel chunk retrieval:
 
-    Returns list of (chunk, similarity_score) tuples.
+    1. Ticker-tagged chunks — SQL fetch, no embedding. Filtered for staleness.
+    2. Cross-reference chunks — ticker appears in tickers_mentioned but is not the primary ticker.
+    3. Philosophy/theme chunks — semantic search using ticker description, not raw user message.
+
+    Returns list of (chunk, similarity_score) tuples, ticker-specific first.
     """
-    try:
-        query_embedding = await embed_text(query)
-    except Exception:
-        logger.warning("Embedding failed, falling back to text search")
-        result = await db.execute(
-            select(AnalystChunk).where(
-                AnalystChunk.content_text.ilike(f"%{query[:50]}%"),
+    from datetime import date, timedelta
+
+    all_tickers = list(set((tickers or []) + (uncovered_tickers or [])))
+    results: list[tuple[AnalystChunk, float]] = []
+    seen_ids: set[str] = set()
+    token_budget = _CHUNK_TOKEN_BUDGET
+
+    def _add(chunk: AnalystChunk, score: float) -> bool:
+        """Add chunk if not seen and within budget. Returns False when budget exhausted."""
+        nonlocal token_budget
+        if str(chunk.id) in seen_ids:
+            return True
+        cost = _estimate_tokens(chunk.content_text)
+        if cost > token_budget and results:  # always allow at least one
+            return False
+        seen_ids.add(str(chunk.id))
+        results.append((chunk, score))
+        token_budget -= cost
+        return True
+
+    # ── Channel 1: Ticker-tagged chunks (SQL, no embedding) ──────────────────
+    if all_tickers:
+        cutoff_90d = date.today() - timedelta(days=90)
+        stmt = (
+            select(AnalystChunk)
+            .where(
+                AnalystChunk.ticker.in_(all_tickers),
                 AnalystChunk.is_stale == False,  # noqa: E712
-            ).limit(limit)
+                # Filter expired short-term chunks
+                ~(
+                    (AnalystChunk.temporal_scope == "short_term")
+                    & (AnalystChunk.publish_date < cutoff_90d)
+                ) | (AnalystChunk.publish_date.is_(None)),
+            )
+            .order_by(AnalystChunk.publish_date.desc().nulls_last())
         )
-        return [(row, 0.0) for row in result.scalars().all()]
+        rows = await db.execute(stmt)
+        for chunk in rows.scalars().all():
+            if not _add(chunk, 1.0):
+                break
 
-    # pgvector cosine distance: smaller = more similar
-    # <=> is cosine distance operator
-    distance = AnalystChunk.embedding.cosine_distance(query_embedding)
-
-    stmt = (
-        select(AnalystChunk, distance.label("distance"))
-        .where(
-            AnalystChunk.embedding.isnot(None),
-            AnalystChunk.is_stale == False,  # noqa: E712
+    # ── Channel 2: Cross-reference chunks (ticker in tickers_mentioned) ──────
+    if all_tickers and token_budget > 0:
+        stmt = (
+            select(AnalystChunk)
+            .where(
+                AnalystChunk.tickers_mentioned.overlap(all_tickers),
+                ~AnalystChunk.ticker.in_(all_tickers) if all_tickers else True,
+                AnalystChunk.is_stale == False,  # noqa: E712
+            )
+            .order_by(AnalystChunk.publish_date.desc().nulls_last())
+            .limit(5)
         )
-        .order_by(distance)
-        .limit(limit * 2)  # fetch extra, then re-rank
-    )
+        rows = await db.execute(stmt)
+        for chunk in rows.scalars().all():
+            if not _add(chunk, 0.8):
+                break
 
-    result = await db.execute(stmt)
-    rows = result.all()
+    # ── Channel 3: Philosophy/theme chunks via semantic search ───────────────
+    if token_budget > 0:
+        # Build semantic query: use ticker descriptions (not raw user message)
+        if all_tickers:
+            meta_tasks = [get_ticker_meta(t) for t in all_tickers[:3]]
+            metas = await asyncio.gather(*meta_tasks, return_exceptions=True)
+            desc_parts = []
+            for t, m in zip(all_tickers[:3], metas):
+                if isinstance(m, Exception):
+                    desc_parts.append(t)
+                else:
+                    parts = [m.long_name]
+                    if m.sector:
+                        parts.append(m.sector)
+                    if m.industry:
+                        parts.append(m.industry)
+                    desc_parts.append(", ".join(parts))
+            semantic_query = "analyst view on " + "; ".join(desc_parts)
+        else:
+            # No ticker — use raw user message (follow-ups, general questions)
+            semantic_query = query
 
-    # Re-rank: boost chunks that mention detected tickers
-    scored = []
-    for chunk, dist in rows:
-        similarity = 1.0 - dist  # convert distance to similarity
-        if tickers and chunk.tickers_mentioned:
-            overlap = set(tickers) & set(chunk.tickers_mentioned)
-            if overlap:
-                similarity += 0.1 * len(overlap)  # boost
-        scored.append((chunk, similarity))
+        try:
+            query_embedding = await embed_text(semantic_query)
+        except Exception:
+            logger.warning("Embedding failed for philosophy retrieval")
+            query_embedding = None
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:limit]
+        if query_embedding is not None:
+            distance = AnalystChunk.embedding.cosine_distance(query_embedding)
+            stmt = (
+                select(AnalystChunk, distance.label("distance"))
+                .where(
+                    AnalystChunk.embedding.isnot(None),
+                    AnalystChunk.is_stale == False,  # noqa: E712
+                    AnalystChunk.ticker.is_(None),  # philosophy/general chunks only
+                )
+                .order_by(distance)
+                .limit(5)
+            )
+            rows = await db.execute(stmt)
+            for chunk, dist in rows.all():
+                similarity = 1.0 - dist
+                if similarity < 0.3:  # threshold: skip irrelevant philosophy
+                    continue
+                if not _add(chunk, similarity):
+                    break
+
+    return results
 
 
 async def _update_chunk_quality(
@@ -929,11 +1021,11 @@ async def chat_endpoint(
     )
     principles.extend(row[0] for row in derived.all())
 
-    # Retrieve relevant analyst chunks (pgvector)
+    # Retrieve relevant analyst chunks (3-channel: ticker SQL + cross-ref + philosophy semantic)
     chunks_with_scores = await _get_relevant_chunks(
-        request.message, db, tickers=tickers
+        request.message, db, tickers=tickers, uncovered_tickers=uncovered_tickers,
     )
-    chunk_texts = [_clean_chunk_text(chunk.content_text) for chunk, _ in chunks_with_scores]
+    chunk_texts = [_clean_chunk_text(_format_chunk_with_meta(chunk)) for chunk, _ in chunks_with_scores]
 
     # Update chunk quality tracking
     if chunks_with_scores:
@@ -1011,6 +1103,12 @@ async def chat_endpoint(
     degraded_note = ""
     if is_degraded:
         degraded_note = f"\n\n*[Running on the economy engine today — {settings.analyst_persona} says even a sloth knows when to conserve energy.]*"
+
+    # Language mirroring: detect query language and instruct LLM to reply in the same language
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", request.message):
+        system_prompt += "\n\n## Language Instruction\nThe user wrote in Chinese (or another CJK language). Reply ENTIRELY in the same language. Do NOT switch to English."
+    else:
+        system_prompt += "\n\n## Language Instruction\nThe user wrote in English. Reply in English only."
 
     # Build messages — include conversation history for follow-up context
     messages = [{"role": "system", "content": system_prompt}]

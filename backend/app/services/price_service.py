@@ -26,6 +26,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL = 30.0  # seconds
+_META_CACHE_TTL = 86400.0  # 24h — name/sector/industry rarely change
 
 
 @dataclass
@@ -33,6 +34,14 @@ class PriceData:
     ticker: str
     price: float
     pe_ratio: float | None
+
+
+@dataclass
+class TickerMeta:
+    """Cached yfinance metadata for semantic retrieval bridge."""
+    long_name: str
+    sector: str
+    industry: str
 
 
 @dataclass
@@ -44,8 +53,18 @@ class _CacheEntry:
         return time.monotonic() - self.fetched_at < _CACHE_TTL
 
 
-# Module-level in-memory cache: ticker → CacheEntry
+@dataclass
+class _MetaCacheEntry:
+    data: TickerMeta
+    fetched_at: float = field(default_factory=time.monotonic)
+
+    def is_fresh(self) -> bool:
+        return time.monotonic() - self.fetched_at < _META_CACHE_TTL
+
+
+# Module-level in-memory caches
 _cache: dict[str, _CacheEntry] = {}
+_meta_cache: dict[str, _MetaCacheEntry] = {}
 
 
 async def _fetch_finnhub(ticker: str) -> float:
@@ -113,6 +132,33 @@ async def get_price(ticker: str, db: AsyncSession | None = None) -> PriceData:
         _cache[ticker] = _CacheEntry(data=data)
 
     return data
+
+
+def _fetch_yfinance_meta(ticker: str) -> TickerMeta:
+    """Synchronous yfinance fetch for name/sector/industry metadata."""
+    import yfinance as yf
+    info = yf.Ticker(ticker).info or {}
+    return TickerMeta(
+        long_name=info.get("longName") or info.get("shortName") or ticker,
+        sector=info.get("sector") or "",
+        industry=info.get("industry") or "",
+    )
+
+
+async def get_ticker_meta(ticker: str) -> TickerMeta:
+    """Get ticker metadata (name, sector, industry). Cached for 24h."""
+    entry = _meta_cache.get(ticker)
+    if entry and entry.is_fresh():
+        return entry.data
+    try:
+        meta = await asyncio.to_thread(_fetch_yfinance_meta, ticker)
+        _meta_cache[ticker] = _MetaCacheEntry(data=meta)
+        return meta
+    except Exception:
+        logger.warning("yfinance meta fetch failed for %s", ticker)
+        if entry:
+            return entry.data
+        return TickerMeta(long_name=ticker, sector="", industry="")
 
 
 async def get_prices_batch(tickers: list[str], db: AsyncSession | None = None) -> dict[str, PriceData]:

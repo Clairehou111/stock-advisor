@@ -51,6 +51,25 @@ async def lifespan(app: FastAPI):
                 "EXCEPTION WHEN undefined_table THEN NULL; END $$"
             )
         )
+        # Create indexes for 3-channel chunk retrieval (safe if already exist)
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_ticker_stale_date "
+                "ON analyst_chunks (ticker, is_stale, publish_date)"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_null_ticker_stale "
+                "ON analyst_chunks (is_stale) WHERE ticker IS NULL"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_tickers_mentioned_gin "
+                "ON analyst_chunks USING GIN (tickers_mentioned)"
+            )
+        )
         await conn.run_sync(Base.metadata.create_all)
     # Mark any tasks that were "running" when the server last died as errors
     from sqlalchemy import update as sa_update
