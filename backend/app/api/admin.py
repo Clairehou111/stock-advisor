@@ -6,6 +6,7 @@ Requires is_admin=True in JWT.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import tempfile
@@ -19,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
 from app.db.session import async_session
-from app.models.tables import IngestTask, User
+from app.models.tables import IngestTask, UploadSource, User
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 logger = logging.getLogger(__name__)
@@ -90,7 +91,6 @@ async def _run_patreon_ingest(task_id: str, post_id: str, force: bool = False) -
             result=result,
             message=(
                 f"Complete — {result['chunk_count']} chunks, "
-                f"{result['signal_count']} signals, "
                 f"{result['image_count']} charts"
             ),
         )
@@ -202,6 +202,25 @@ def _upload_bytes_to_r2(file_bytes: bytes, r2_key: str) -> None:
     logger.info("Uploaded %d bytes to R2: %s", len(file_bytes), r2_key)
 
 
+def _file_sha256(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+async def _find_existing_excel_r2_key(file_sha256: str) -> str | None:
+    async with async_session() as db:
+        result = await db.execute(
+            select(UploadSource.r2_key)
+            .where(
+                UploadSource.file_type == "xlsx",
+                UploadSource.r2_key.is_not(None),
+                UploadSource.extracted_json["file_sha256"].astext == file_sha256,
+            )
+            .order_by(UploadSource.upload_timestamp.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
 # ── Excel background runner ───────────────────────────────────────────────────
 
 async def _run_excel_ingest(task_id: str, file_bytes: bytes, filename: str) -> None:
@@ -211,9 +230,17 @@ async def _run_excel_ingest(task_id: str, file_bytes: bytes, filename: str) -> N
         await _update_task(task_id, message=msg)
 
     try:
-        r2_key = f"excel/{task_id}/{filename}"
-        await progress(f"Uploading to R2: {r2_key}")
-        await asyncio.to_thread(_upload_bytes_to_r2, file_bytes, r2_key)
+        file_sha256 = _file_sha256(file_bytes)
+        file_size = len(file_bytes)
+        safe_name = Path(filename).name
+
+        r2_key = await _find_existing_excel_r2_key(file_sha256)
+        if r2_key:
+            await progress(f"Duplicate workbook detected (sha256={file_sha256[:12]}...) — reusing existing R2 object: {r2_key}")
+        else:
+            r2_key = f"excel/{file_sha256}/{safe_name}"
+            await progress(f"Uploading to R2: {r2_key}")
+            await asyncio.to_thread(_upload_bytes_to_r2, file_bytes, r2_key)
 
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
             tmp.write(file_bytes)
@@ -224,6 +251,7 @@ async def _run_excel_ingest(task_id: str, file_bytes: bytes, filename: str) -> N
                 result = await run_excel_ingest(
                     tmp_path, return_result=True, db=db,
                     progress_cb=progress, r2_key=r2_key,
+                    file_sha256=file_sha256, file_size=file_size, original_filename=safe_name,
                 )
                 await db.commit()
         finally:

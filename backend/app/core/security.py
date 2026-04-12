@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from jose import JWTError, jwt
@@ -128,11 +128,31 @@ def decode_token(token: str) -> dict:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """FastAPI dependency: extract and validate user from JWT."""
-    payload = decode_token(credentials.credentials)
+    """FastAPI dependency: extract and validate user from JWT.
+
+    Checks (in order):
+    1. httpOnly cookie 'access_token'
+    2. Authorization: Bearer <token> header
+    """
+    token = None
+
+    # 1. Try cookie first
+    cookie_token = request.cookies.get("access_token")
+    if cookie_token:
+        token = cookie_token
+
+    # 2. Fall back to Authorization header
+    if not token and credentials:
+        token = credentials.credentials
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = decode_token(token)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")

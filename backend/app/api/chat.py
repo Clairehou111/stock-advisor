@@ -20,11 +20,11 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select, text, update
+from sqlalchemy import case, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -178,6 +178,46 @@ class ChatResponse(BaseModel):
     is_degraded: bool = False
 
 
+class ConversationSummaryResponse(BaseModel):
+    id: str
+    title: str | None = None
+    created_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
+
+
+class ConversationListResponse(BaseModel):
+    conversations: list[ConversationSummaryResponse]
+
+
+class ConversationMessageResponse(BaseModel):
+    id: str
+    role: str
+    content: str
+    model_used: str | None = None
+    tokens_used: int | None = None
+    tickers_mentioned: list[str] | None = None
+    metadata_json: dict | None = None
+    created_at: datetime
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation_id: str
+    title: str | None = None
+    summary: str | None = None
+    total_message_count: int = 0
+    truncated: bool = False
+    messages: list[ConversationMessageResponse]
+
+
+def _message_role_rank():
+    return case(
+        (Message.role == "user", 0),
+        (Message.role == "assistant", 1),
+        else_=2,
+    )
+
+
 def _query_ngrams(query: str) -> list[str]:
     """Extract 1-, 2-, and 3-word lowercase n-grams from query.
 
@@ -206,14 +246,31 @@ def _query_ngrams(query: str) -> list[str]:
 
 
 _COMMON_WORDS = {
+    # Stop words
     "the", "a", "an", "is", "it", "be", "do", "go", "in", "on", "at", "to",
     "for", "of", "by", "as", "or", "and", "but", "if", "my", "we", "i",
     "me", "us", "he", "she", "are", "was", "has", "had", "did", "got",
     "what", "when", "where", "why", "how", "who", "which", "that", "this",
     "with", "from", "have", "been", "will", "would", "could", "should",
     "today", "now", "just", "up", "down", "about", "any", "all", "get",
-    "think", "look", "like", "going", "doing", "price", "market", "stock",
-    "stocks", "index", "fund", "etf", "crypto", "money", "buy", "sell",
+    "think", "look", "like", "going", "doing", "than", "then", "also",
+    "very", "much", "more", "most", "some", "such", "only", "over",
+    "same", "both", "each", "well", "back", "been", "here", "there",
+    "yes", "no", "ok", "okay", "sure", "right", "good", "bad", "great",
+    "hey", "hi", "hello", "thanks", "thank", "sorry", "please", "can",
+    "tell", "show", "give", "help", "know", "want", "need", "let",
+    "say", "said", "make", "take", "come", "keep", "still", "into",
+    # Financial common words (not tickers)
+    "price", "market", "stock", "stocks", "index", "fund", "etf", "crypto",
+    "money", "buy", "sell", "hold", "long", "short", "call", "put",
+    "bull", "bear", "dip", "drop", "fall", "rise", "gain", "loss",
+    "zone", "range", "level", "high", "low", "top", "peak", "trim",
+    "cost", "value", "fair", "cheap", "risk", "safe",
+    "trend", "move", "open", "close", "trade", "wait", "watch",
+    "plunge", "crash", "rally", "surge", "dump", "pump", "moon",
+    "current", "recent", "next", "last", "first", "year", "month",
+    "week", "day", "time", "ago", "soon", "early", "late",
+    "portfolio", "position", "exposure", "allocation",
 }
 
 
@@ -248,27 +305,41 @@ async def _extract_entities(
             index_map[row.resolved_value] = _INDEX_DISPLAY.get(row.resolved_value, row.resolved_value)
 
     # ── Step 2: decide if LLM needed ─────────────────────────────────────────
-    # Look for short uppercase-ish tokens that aren't covered yet
-    unresolved = [
+    # Only consider single-word unresolved tokens that look like tickers
+    # (1-6 uppercase letters, not common words, not numbers)
+    unresolved_ticker_shaped = [
         t for t in ngrams
         if t not in db_hits
         and t not in _COMMON_WORDS
-        and len(t) <= 20          # ignore long phrases already missed
+        and len(t.split()) == 1   # single word only
+        and len(t) <= 6
         and not t.isdigit()
+        and any(c.isalpha() for c in t)
     ]
-    needs_llm = bool(unresolved) and not (tickers or index_map)
-    # Also trigger LLM if there are short (≤6 char) unresolved tokens —
-    # these are likely ticker-shaped words the DB just hasn't seen yet.
-    if not needs_llm and unresolved:
-        short_unresolved = [t for t in unresolved if len(t.split()) == 1 and len(t) <= 6]
-        needs_llm = bool(short_unresolved)
-    # Also trigger LLM when we have conversation context but no tickers found —
-    # let LLM decide if this is a follow-up ("can i short it") or general ("what is pe")
+    # LLM needed only if we have ticker-shaped unknowns AND no tickers found yet
+    needs_llm = bool(unresolved_ticker_shaped) and not (tickers or index_map)
+
+    # Follow-up detection: if prev_tickers exist, no tickers found, AND
+    # query has financial intent words — likely a follow-up, carry prev_tickers instead of calling LLM
+    _FOLLOWUP_WORDS = {"it", "its", "this", "that", "them", "those", "same", "again",
+                       "short", "buy", "sell", "trim", "hold", "accumulate", "covered"}
     if not needs_llm and not tickers and not index_map and prev_tickers:
-        needs_llm = True
+        query_words = set(query.lower().split())
+        if query_words & _FOLLOWUP_WORDS:
+            # Looks like a follow-up — carry prev_tickers directly, skip LLM
+            needs_llm = False  # will be handled by the caller's prev_tickers carry logic
+        else:
+            needs_llm = True  # genuinely unknown query, ask LLM
 
     needs_history = False
     is_social = False
+
+    # For detected follow-ups (matched _FOLLOWUP_WORDS), signal needs_history
+    # so the caller carries prev_tickers without an LLM call
+    if not needs_llm and not tickers and not index_map and prev_tickers:
+        query_words = set(query.lower().split())
+        if query_words & _FOLLOWUP_WORDS:
+            needs_history = True
 
     if needs_llm and settings.deepseek_api_key:
         import httpx
@@ -373,6 +444,25 @@ async def _get_principles(db: AsyncSession) -> list[str]:
 
 _CHUNK_TOKEN_BUDGET = 3000  # approximate token budget for all retrieved chunks
 
+# Map canonical index symbols → all aliases that might appear as chunk tickers
+_INDEX_TICKER_ALIASES: dict[str, list[str]] = {
+    "^GSPC": ["^GSPC", "SPX", "S&P", "S&P500", "SP500"],
+    "^IXIC": ["^IXIC", "COMPQ", "NASDAQ"],
+    "^DJI":  ["^DJI", "DJIA", "DOW"],
+    "^VIX":  ["^VIX", "VIX"],
+    "^RUT":  ["^RUT", "RUT", "RUSSELL"],
+    "^NDX":  ["^NDX", "NDX", "QQQ"],
+}
+
+
+def _expand_index_aliases(tickers: list[str]) -> list[str]:
+    """Expand index symbols to include all known aliases for chunk matching."""
+    expanded = set(tickers)
+    for t in tickers:
+        if t in _INDEX_TICKER_ALIASES:
+            expanded.update(_INDEX_TICKER_ALIASES[t])
+    return list(expanded)
+
 
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token for English."""
@@ -409,7 +499,9 @@ async def _get_relevant_chunks(
     """
     from datetime import date, timedelta
 
-    all_tickers = list(set((tickers or []) + (uncovered_tickers or [])))
+    all_tickers = _expand_index_aliases(
+        list(set((tickers or []) + (uncovered_tickers or [])))
+    )
     results: list[tuple[AnalystChunk, float]] = []
     seen_ids: set[str] = set()
     token_budget = _CHUNK_TOKEN_BUDGET
@@ -648,6 +740,21 @@ async def _load_conversation_history(
 
     messages: list[dict] = []
 
+    # Inject a list of ALL tickers discussed in this conversation (for meta-queries like "list all stocks")
+    all_tickers_result = await db.execute(
+        text(
+            "SELECT ARRAY(SELECT DISTINCT unnest(tickers_mentioned) "
+            "FROM messages WHERE conversation_id = :cid AND tickers_mentioned IS NOT NULL)"
+        ),
+        {"cid": conv_uuid},
+    )
+    all_conv_tickers = all_tickers_result.scalar()
+    if all_conv_tickers:
+        messages.append({
+            "role": "system",
+            "content": f"## All tickers discussed in this conversation\n{', '.join(sorted(all_conv_tickers))}",
+        })
+
     # Inject per-ticker context map (preferred over flat summary)
     if conv.context_map and current_tickers:
         relevant = {t: conv.context_map[t] for t in current_tickers if t in (conv.context_map or {})}
@@ -882,6 +989,113 @@ def _classify_intent(query: str, has_tickers: bool) -> tuple[str, int]:
     return "casual", 400
 
 
+@router.get("/conversations", response_model=ConversationListResponse)
+async def list_conversations(
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    limit = max(1, min(limit, 50))
+    last_message_sq = (
+        select(
+            Message.conversation_id.label("conversation_id"),
+            func.max(Message.created_at).label("last_message_at"),
+            func.count(Message.id).label("message_count"),
+        )
+        .group_by(Message.conversation_id)
+        .subquery()
+    )
+
+    result = await db.execute(
+        select(
+            Conversation,
+            last_message_sq.c.last_message_at,
+            last_message_sq.c.message_count,
+        )
+        .outerjoin(last_message_sq, last_message_sq.c.conversation_id == Conversation.id)
+        .where(Conversation.user_id == current_user.id)
+        .order_by(func.coalesce(last_message_sq.c.last_message_at, Conversation.created_at).desc())
+        .limit(limit)
+    )
+
+    conversations = [
+        ConversationSummaryResponse(
+            id=str(conv.id),
+            title=conv.title,
+            created_at=conv.created_at,
+            last_message_at=last_message_at,
+            message_count=message_count or 0,
+        )
+        for conv, last_message_at, message_count in result.all()
+    ]
+    return ConversationListResponse(conversations=conversations)
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+async def get_conversation(
+    conversation_id: str,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    limit = max(1, min(limit, 200))
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+
+    conv_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conv_uuid,
+            Conversation.user_id == current_user.id,
+        )
+    )
+    conversation = conv_result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    total_messages_result = await db.execute(
+        select(func.count(Message.id)).where(Message.conversation_id == conv_uuid)
+    )
+    total_message_count = total_messages_result.scalar() or 0
+    role_rank = _message_role_rank()
+
+    message_ids_sq = (
+        select(Message.id)
+        .where(Message.conversation_id == conv_uuid)
+        .order_by(Message.created_at.desc(), role_rank.desc())
+        .limit(limit)
+        .subquery()
+    )
+    messages_result = await db.execute(
+        select(Message)
+        .where(Message.id.in_(select(message_ids_sq.c.id)))
+        .order_by(Message.created_at.asc(), role_rank.asc())
+    )
+    messages = [
+        ConversationMessageResponse(
+            id=str(msg.id),
+            role=msg.role,
+            content=msg.content,
+            model_used=msg.model_used,
+            tokens_used=msg.tokens_used,
+            tickers_mentioned=msg.tickers_mentioned,
+            metadata_json=msg.metadata_json,
+            created_at=msg.created_at,
+        )
+        for msg in messages_result.scalars().all()
+    ]
+
+    return ConversationDetailResponse(
+        conversation_id=str(conversation.id),
+        title=conversation.title,
+        summary=conversation.summary,
+        total_message_count=total_message_count,
+        truncated=total_message_count > limit,
+        messages=messages,
+    )
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest,
@@ -916,6 +1130,8 @@ async def chat_endpoint(
 
     # Short-circuit: social/acknowledgment messages — no stock data needed
     if is_social:
+        user_created_at = datetime.now(timezone.utc)
+        assistant_created_at = user_created_at + timedelta(microseconds=1)
         messages = [
             {"role": "system", "content": "You are a friendly stock market advisor. "
              "The user sent a brief social message. Respond warmly in 1-2 sentences. "
@@ -931,9 +1147,20 @@ async def chat_endpoint(
             db.add(conv)
             await db.flush()
             conv_id = str(conv.id)
-        db.add(Message(conversation_id=uuid.UUID(conv_id), role="user", content=request.message))
-        db.add(Message(conversation_id=uuid.UUID(conv_id), role="assistant", content=response.content,
-                       model_used=response.model_used, tokens_used=response.total_tokens))
+        db.add(Message(
+            conversation_id=uuid.UUID(conv_id),
+            role="user",
+            content=request.message,
+            created_at=user_created_at,
+        ))
+        db.add(Message(
+            conversation_id=uuid.UUID(conv_id),
+            role="assistant",
+            content=response.content,
+            model_used=response.model_used,
+            tokens_used=response.total_tokens,
+            created_at=assistant_created_at,
+        ))
         await db.commit()
         return ChatResponse(reply=response.content, conversation_id=conv_id,
                             model_used=response.model_used, tokens_used=response.total_tokens, is_degraded=is_degraded)
@@ -1022,8 +1249,11 @@ async def chat_endpoint(
     principles.extend(row[0] for row in derived.all())
 
     # Retrieve relevant analyst chunks (3-channel: ticker SQL + cross-ref + philosophy semantic)
+    # Include index symbols (e.g. ^GSPC) so S&P prediction chunks are found
+    index_symbols = [sym for sym, _ in index_queries] if index_queries else []
     chunks_with_scores = await _get_relevant_chunks(
-        request.message, db, tickers=tickers, uncovered_tickers=uncovered_tickers,
+        request.message, db, tickers=tickers,
+        uncovered_tickers=uncovered_tickers + index_symbols,
     )
     chunk_texts = [_clean_chunk_text(_format_chunk_with_meta(chunk)) for chunk, _ in chunks_with_scores]
 
@@ -1175,6 +1405,8 @@ async def chat_endpoint(
     # Save user message + assistant response with annotations
     tickers_for_save = all_mentioned or None
     msg_meta = _classify_message_metadata(request.message, all_mentioned)
+    user_created_at = datetime.now(timezone.utc)
+    assistant_created_at = user_created_at + timedelta(microseconds=1)
 
     db.add(Message(
         conversation_id=uuid.UUID(conv_id),
@@ -1182,6 +1414,7 @@ async def chat_endpoint(
         content=request.message,
         tickers_mentioned=tickers_for_save,
         metadata_json=msg_meta,
+        created_at=user_created_at,
     ))
     db.add(Message(
         conversation_id=uuid.UUID(conv_id),
@@ -1191,6 +1424,7 @@ async def chat_endpoint(
         tokens_used=response.total_tokens,
         tickers_mentioned=tickers_for_save,
         metadata_json=msg_meta,
+        created_at=assistant_created_at,
     ))
     await db.commit()
 

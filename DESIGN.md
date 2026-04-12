@@ -92,11 +92,11 @@ enforces no celebrity impersonation; the persona is grounded in Sid Sloth's meth
 
 External APIs:
   • OpenRouter (Qwen3 235B A22B — primary chat)
-  • DeepSeek V3 (fallback chat, rephrase, signal extraction, summarization)
-  • Gemini 2.5 Flash (metadata extraction, chart analysis)
-  • text-embedding-004 / Gemini embedding (768-dim vectors)
+  • DeepSeek V3 (fallback chat, summarization, entity extraction)
+  • Gemini 3.1 Pro (Patreon/doc ingestion — single multimodal call per post)
+  • Gemini embedding-2-preview / Qwen3-embedding-4B fallback (1024-dim vectors)
   • Finnhub (real-time stock prices, 60 req/min free tier)
-  • yfinance (PE ratio, index prices, fallback price)
+  • yfinance (PE ratio, index prices, ticker metadata, fallback price)
   • Cloudflare R2 (file storage for Excel, PDFs, Patreon images)
 ```
 
@@ -125,14 +125,15 @@ External APIs:
 | `messages` | Chat turns | id, conversation_id, role, content, model_used, tokens_used, source_ids, tickers_mentioned, metadata_json |
 | `portfolio_holdings` | User positions | id, user_id, ticker, shares, avg_cost_basis |
 | `stock_predictions` | Analyst data (Excel) | ticker, buy_high/low, sell_start, pe_range_high/low, fair_value, egf*, fundamentals, trend_status, is_current, superseded_by |
-| `analyst_chunks` | RAG chunks | id, ticker, chunk_type, content_text, embedding (Vector 768), temporal_scope, metadata_json, outlook_horizon, publish_date, tickers_mentioned, thesis_direction, retrieval_count, avg_relevance, last_retrieved, is_stale |
+| `analyst_chunks` | RAG chunks | id, ticker, chunk_type, content_text, embedding (Vector 1024), temporal_scope, metadata_json (includes section, post_id, key_levels), outlook_horizon, publish_date, tickers_mentioned, thesis_direction, retrieval_count, avg_relevance, last_retrieved, is_stale |
 | `principle_corpus` | Investing principles (static) | id, principle_text, category, source_ids, version |
 | `derived_principles` | Principles extracted from posts | id, principle_text, category, confidence_score, times_stated, source_chunk_ids, first_seen, last_reinforced, is_active, superseded_by |
 | `upload_sources` | File provenance | id, file_type, r2_key, sheet_name, extracted_json, conflict_report, change_summary, raw_content, upload_timestamp |
-| `trade_signals` | Buy/trim/sell signals from posts | id, ticker, action, price_level, confidence, post_id, publish_date, context_text, upload_source_id |
+| `trade_signals` | *(deprecated — signals now stored as key_levels in analyst_chunks.metadata_json)* | — |
 | `rate_limit_usage` | Token tracking | user_id, usage_date, tokens_used, queries_count |
 | `anonymization_rules` | Dynamic scrub rules | original_term (unique), replacement, category |
-| `price_cache` | Price/PE cache (5-min TTL) | ticker (PK), price, pe_ratio, fetched_at |
+| `price_cache` | *(deprecated — replaced by in-memory cache with 30s TTL in price_service.py)* | — |
+| `ingest_tasks` | Durable task state | id, task_type (patreon/excel/doc), status (running/done/error), messages (JSONB), result (JSONB), error, created_at |
 | `entity_aliases` | Alias → symbol cache | alias (PK, lowercase), resolved_type, resolved_value, created_at |
 
 ### Entity Relationships
@@ -163,6 +164,13 @@ or a manual `ALTER TABLE` run.
 
 ## 4. Ingestion Pipelines
 
+### Design Principle: "One LLM Call, Full Context"
+
+Ingestion quality determines everything downstream. Rather than splitting documents into
+sections and processing each in isolation (losing cross-references and context), each
+ingestion pipeline sends the **full document** to a single LLM call. The LLM sees all text
+and images together, producing properly tagged and classified chunks in one pass.
+
 ### Excel Spreadsheet Ingestion (`scripts/ingest_excel.py` + `app/ingestion/excel_parser.py`)
 
 Triggered via `POST /api/admin/ingest/excel` (file upload) or CLI: `python -m scripts.ingest_excel <path.xlsx>`
@@ -182,40 +190,73 @@ Triggered via `POST /api/admin/ingest/patreon` (post URL or numeric ID). Support
 2. Save raw `content_json_string` to `UploadSource.raw_content`
 3. Extract ProseMirror nodes (text + image) from content JSON
 4. Filter: remove identity markers (URLs, copyright, Patreon refs) and political-only paragraphs
-5. Split into sections using CONTENTS heading structure
-6. Extract trade signals per section via DeepSeek (structured JSON: ticker, action, price_level, confidence)
-7. Per section: accumulate text until image node, then flush as chunk:
-   - Rephrase text to neutral voice (DeepSeek)
-   - Download chart image → upload to R2
-   - Analyze chart via Gemini 2.5 Flash vision
-   - Extract metadata (tickers, temporal_scope, horizon, thesis_direction, chunk_type) via Gemini 2.5 Flash
-   - Create `AnalystChunk` record
-8. Embed all new chunks in batch (text-embedding-004 / 768-dim)
-9. Store chunks with embeddings to DB
+5. Download ALL chart images from image nodes (no cap)
+6. **Single Gemini 3.1 Pro multimodal call**: entire post text + all images → structured JSON:
+   ```json
+   {
+     "post_summary": "...",
+     "chunks": [{
+       "section": "S&P Trend Forecast",
+       "content": "rephrased neutral analyst text with chart analysis inline",
+       "primary_ticker": "^GSPC",
+       "tickers_mentioned": ["^GSPC"],
+       "chunk_type": "prediction|philosophy|commentary|egf_explanation",
+       "temporal_scope": "short_term|long_term|general",
+       "thesis_direction": "bullish|bearish|neutral|mixed",
+       "key_levels": [{"price": 6520, "type": "sell", "significance": "critical", "note": "MOAL"}]
+     }]
+   }
+   ```
+7. Parse JSON into `AnalystChunk` rows — `key_levels` stored in `metadata_json`
+8. Embed all chunks in batch (gemini-embedding-2-preview / 1024-dim, fallback qwen3-embedding-4b)
+9. Upload images to R2 for backup
 10. Distill principles from new chunk IDs (`app/jobs/distill_principles.py`)
-11. Resume support: tracks already-processed sections, skips them on retry; always re-extracts signals
+
+**Key prompt rules for the Gemini call:**
+- Use real tradeable ticker symbols — read chart labels to identify (e.g. CRCL not "Circle")
+- Canonical index symbols: `^GSPC` for S&P 500, `^IXIC` for NASDAQ, `^DJI` for Dow, `^VIX` for VIX
+- When a section has specific price levels for multiple stocks, split into per-ticker chunks
+- Keep portfolio-level strategy and historical drawdown tables as their own chunks (don't split)
+- Preserve full analytical detail — do not over-summarize
+- Remove author names, URLs, identifying info (anonymization baked into prompt)
+- Merge chart analysis into relevant chunk content, don't create separate chart chunks
+
+**Why single-call is better than per-section:**
+- The LLM sees the full post context — "Bear Market Milestones" is correctly tagged `^GSPC`
+  because the model can see the surrounding S&P discussion
+- Charts are analyzed alongside the text that explains them — "Circle Internet Group" on
+  a chart label resolves to ticker `CRCL`
+- One API call instead of 35+ sequential calls — faster, simpler, fewer failure points
+- Properly consolidated chunks (18-24 per post vs 50+) with per-ticker splitting where needed
 
 ### Document Ingestion (`app/ingestion/doc_parser.py`)
 
 Triggered via `POST /api/admin/ingest/doc` (PDF, .txt, or .md upload).
 
 1. Read file (PDF via pypdf, or plain text)
-2. Chunk into 300–500 token segments at paragraph boundaries; falls back to sentence boundaries for oversized paragraphs
-3. Anonymize all chunks via `Anonymizer.scrub()`
-4. Rephrase each chunk to neutral voice (DeepSeek, 0.5s delay between calls)
-5. Extract metadata per chunk via Gemini 2.5 Flash (1 req/sec rate limit)
-6. Embed all chunks in batch
-7. Create `UploadSource` + `AnalystChunk` records
+2. **Single Gemini 3.1 Pro call**: full document text → structured JSON (same format as Patreon)
+3. Parse JSON into `AnalystChunk` rows
+4. Embed all chunks in batch
+5. Create `UploadSource` + `AnalystChunk` records
 
 ### Admin Background Task Pattern
 
 All three ingestion pipelines run as async background tasks dispatched with `asyncio.create_task()`.
 The endpoint immediately returns a `task_id`; the frontend polls `GET /api/admin/ingest/status/{task_id}`.
-Task state is held in the in-memory `_tasks` dict (not persisted — lost on restart).
+Task state is persisted in the `ingest_tasks` table (durable across server restarts).
+On startup, any tasks with `status="running"` are marked as `error` (interrupted by restart).
+`GET /api/admin/ingest/active` returns all tasks from the last 24h for frontend restoration.
 
 ---
 
 ## 5. Chat Pipeline
+
+### Design Principle: "Feed the LLM, Don't Fight It"
+
+The chat pipeline's job is to assemble the right data for the LLM, not to compensate for
+bad data with post-processing patches. If the system prompt has the right information and
+the question is clear, the LLM answers correctly 95%+ of the time. Complexity is in the
+data assembly, not in output correction.
 
 ### Request Lifecycle (`app/api/chat.py`)
 
@@ -223,90 +264,90 @@ Task state is held in the in-memory `_tasks` dict (not persisted — lost on res
 User sends POST /api/chat {message, conversation_id?}
   │
   ▼
-[1] AUTH — validate JWT, load User from DB
+[1] AUTH + RATE LIMIT
+    Validate JWT, check daily token budget.
+    <80%: Qwen3 primary | 80–100%: DeepSeek degraded | >100%: 429 reject
   │
   ▼
-[2] RATE LIMIT — check daily tokens
-      <80%:  Qwen3 (primary)
-      80–100%: DeepSeek (degraded)
-      >100%: 429 reject
+[2] ENTITY EXTRACTION
+    a. DB lookup: n-grams against entity_aliases (instant, handles CJK mixed text)
+    b. LLM fallback (DeepSeek): unresolved financial terms → returns tickers, indices,
+       needs_history, is_social. New aliases saved with ON CONFLICT DO NOTHING.
+    c. Index alias expansion: ^GSPC → [^GSPC, SPX, S&P, S&P500, SP500] for chunk matching
   │
   ▼
-[3] ENTITY EXTRACTION
-    a. DB lookup: query n-grams against entity_aliases (instant)
-    b. LLM fallback (DeepSeek): only when unresolved financial terms remain,
-       short unresolved tokens exist, or prev_tickers present but no match
-       — LLM also returns needs_history + is_social flags
-       — New aliases persisted back to entity_aliases for future queries
+[3] COVERAGE CHECK
+    Split tickers into covered (in stock_predictions) / uncovered.
+    If follow-up with no tickers: carry from last message in history.
   │
   ▼
-[4] SHORT-CIRCUIT: is_social=true
-    → tiny LLM call (60 max_tokens), save messages, return
+[4] CONVERSATION HISTORY
+    Load last 3 turn pairs verbatim from DB. No filtering, no compression.
+    If conversation is long, inject flat summary from background summarization.
   │
   ▼
-[5] COVERAGE CHECK — split tickers into covered / uncovered
-    If needs_history and no tickers found: carry prev_tickers from history
-  │
-  ▼
-[6] CONVERSATION HISTORY — ticker-aware filtering
-    - Most recent turn: always included verbatim
-    - Older turns: include verbatim if tickers overlap; else compress to marker
-    - Per-ticker context_map injected for currently discussed tickers
-    - Flat summary used if no context_map available
-  │
-  ▼
-[7] INTENT CLASSIFICATION → max_tokens
-    portfolio_review: 2000 | ticker_analysis: 1500 | philosophy: 1000 | casual: 400
-  │
-  ▼
-[8] CONTEXT BUILDING (covered tickers)
+[5] CONTEXT BUILDING (covered tickers)
     - Load StockPrediction from DB
     - Fetch live price (Finnhub) + PE (yfinance) concurrently
-    - Run decision engine (deterministic zone/trim math)
-    - Format stock context + metrics strings
+    - Run decision engine (deterministic zone/trim/PE math)
+    - Format stock context + decision metrics strings
   │
   ▼
-[9] CONTEXT BUILDING (uncovered tickers)
+[6] CONTEXT BUILDING (uncovered tickers + indices)
     - Fetch live price + PE
-    - Inject as general framework note (no analyst-specific zones)
+    - Inject price data (LLM applies general framework from retrieved chunks)
   │
   ▼
-[10] RAG — embed query → cosine search analyst_chunks
-     Re-rank with ticker boost (+0.1 per overlapping ticker)
-     Update retrieval_count, avg_relevance, last_retrieved
+[7] CHUNK RETRIEVAL (3-channel RAG)
+    Channel 1: SQL fetch by ticker (no embedding) — all chunks tagged with the ticker,
+               filtered for staleness, short-term expiry >90d removed, newest first.
+               Index aliases expanded (^GSPC matches S&P, SPX, etc.)
+    Channel 2: SQL cross-reference — chunks where ticker appears in tickers_mentioned
+    Channel 3: Semantic search for philosophy chunks (ticker=NULL) using ticker
+               description from yfinance as the embedding query, not the raw user message.
+               Metadata cached 24h via get_ticker_meta().
+    All channels: token budget of ~3000, deduplicated, ticker-specific chunks first.
+    Chunks formatted with [date | temporal_scope | thesis_direction] prefix.
   │
   ▼
-[11] LOAD PRINCIPLES
-     PrincipleCorpus (all) + DerivedPrinciple (active, top 20 by confidence)
+[8] LOAD PRINCIPLES + PORTFOLIO + EARNINGS
+    Top 10 derived principles, portfolio holdings, upcoming earnings calendar.
   │
   ▼
-[12] SYSTEM PROMPT ASSEMBLY
-     Principles + stock context + decision metrics + RAG chunks +
-     portfolio holdings + earnings calendar + index prices +
-     focus directive (if conversation history present)
+[9] SYSTEM PROMPT ASSEMBLY
+    Persona + principles + stock context + decision metrics + chunk commentary +
+    portfolio + earnings + index prices + language instruction (CJK detection)
   │
   ▼
-[13] LLM CALL (Qwen3 via OpenRouter, fallback DeepSeek)
-     max_tokens = intent-based budget
-     Qwen3: sends max_tokens + THINKING_BUDGET (10,000) to API
+[10] LLM CALL
+     Qwen3 235B via OpenRouter (with 10K thinking budget) → DeepSeek V3 fallback
+     Max output tokens: 1500
   │
   ▼
-[14] POST-PROCESSING
-     - Anonymizer.post_check() (Layer 3: flag URLs/emails in output)
-     - Fact check: ticker drift detection + price sanity (>50% off = flag)
-     - Ticker drift: prepend redirect header if response discusses wrong tickers
+[11] POST-PROCESSING + SAVE
+     - Anonymizer.post_check() (Layer 3)
+     - Record token usage
+     - Save Conversation + Messages (with ticker tags for future history resolution)
   │
   ▼
-[15] SAVE
-     - Record token usage (rate_limiter)
-     - Create/update Conversation record
-     - Save user + assistant Messages with tickers_mentioned + metadata_json annotations
-  │
-  ▼
-[16] BACKGROUND (non-blocking, asyncio.create_task)
-     If conversation has ≥ _SUMMARIZE_AFTER_TURNS * 2 messages:
-       Summarize older turns → Conversation.summary + context_map
+[12] BACKGROUND (non-blocking)
+     If conversation ≥ 12 messages: summarize older turns → Conversation.summary
 ```
+
+### What Was Removed (and Why)
+
+| Removed | Reason |
+|---------|--------|
+| Social message short-circuit | LLM handles "hello" naturally with a 1-line system prompt note |
+| Intent classification + max_tokens routing | Hardcoded 1500 tokens; LLM self-regulates response length |
+| Price query detection + directive | Live price is prominently in the data; LLM leads with it naturally |
+| Fact check + ticker drift correction | If data is right, response is right. Regex price check was noisy |
+| Message metadata annotations (intent/sentiment) | Nothing downstream consumed them |
+| Chunk quality tracking (retrieval_count etc.) | Analytics overhead on every query, never read |
+| Focus directive injection | With proper data for the current ticker, LLM answers correctly |
+| Ticker-aware history filtering | Last 3 turns verbatim is simpler and equally effective |
+| Per-ticker context_map | Flat summary is sufficient |
+| Uncovered ticker verbose framework instructions | Chunks already contain the analyst's philosophy |
 
 ---
 
@@ -370,13 +411,18 @@ and `POLITICAL_SIGNALS` (keywords for off-topic paragraph removal during Patreon
 |---|---|---|
 | Chat (primary) | Qwen3 235B A22B | OpenRouter (`qwen/qwen3-235b-a22b`) |
 | Chat (fallback/economy) | DeepSeek V3 | Direct DeepSeek API (`deepseek-chat`) |
-| Rephrase (ingestion) | DeepSeek V3 | Direct DeepSeek API |
-| Signal extraction (ingestion) | DeepSeek V3 | Direct DeepSeek API |
-| Entity extraction (chat) | DeepSeek V3 | Direct DeepSeek API (8s timeout) |
+| **Ingestion (Patreon + docs)** | **Gemini 3.1 Pro** | **google-genai SDK, multimodal (text + images), single call per post** |
+| Excel rephrase (ingestion) | DeepSeek V3 | Direct DeepSeek API |
+| Entity extraction (chat) | DeepSeek V3 | Direct DeepSeek API |
 | Conversation summarization | DeepSeek V3 | Direct DeepSeek API |
-| Metadata extraction | Gemini 2.5 Flash | google-genai SDK (sync, via asyncio.to_thread) |
-| Chart analysis | Gemini 2.5 Flash | google-genai SDK with vision |
-| Embeddings | text-embedding-004 | `app/services/embedding_service.py` |
+| Embeddings (primary) | gemini-embedding-2-preview | google-genai SDK, 1024 dimensions |
+| Embeddings (fallback) | qwen3-embedding-4b | OpenRouter, 1024 dimensions |
+
+**Why Gemini 3.1 Pro for ingestion:** Ingestion runs a few times per week. Quality matters
+more than cost or speed. The multimodal capability processes text + chart images in a single
+call, producing correctly tagged chunks that the entire downstream pipeline depends on.
+Tested on real posts: proper `^GSPC` tagging, `CRCL` resolution from chart labels,
+annotated key_levels with significance.
 
 ### Qwen3 Thinking Budget
 
@@ -394,14 +440,10 @@ thinking blocks).
 - At 100%: reject with 429
 - Reset: daily (new date = new `rate_limit_usage` row; no cron needed)
 
-### Max Output Tokens (by intent)
+### Max Output Tokens
 
-| Query Type | Max Output Tokens |
-|---|---|
-| Portfolio review | 2,000 |
-| Ticker analysis | 1,500 |
-| Philosophy question | 1,000 |
-| Casual / social | 400 (social short-circuit: 60) |
+All chat queries use a flat budget of **1,500 tokens**. The LLM self-regulates response
+length based on question complexity. Intent classification was removed as unnecessary overhead.
 
 ---
 
@@ -413,14 +455,20 @@ The entity resolution system eliminates manual alias maintenance.
 
 1. **DB lookup (fast path)**: All n-grams (1-, 2-, 3-word) from the query are batch-fetched
    from `entity_aliases`. Common financial words are pre-seeded at startup (`_SEED_ALIASES`
-   in `app/core/security.py`).
+   in `app/core/security.py`). Mixed-script handling: for CJK text containing Latin tokens
+   (e.g. "告诉我SP的价格"), ASCII sub-tokens are extracted so "SP" is found even without
+   whitespace separation.
 
 2. **LLM fallback**: DeepSeek is called when the DB has unresolved short tokens that look
    like tickers, or when conversation context exists but no tickers were found (potential
    follow-up). The LLM also returns `needs_history` and `is_social` flags.
 
 3. **Alias persistence**: New aliases found by the LLM are written back to `entity_aliases`
-   so future queries skip the LLM call.
+   using `INSERT ... ON CONFLICT DO NOTHING` to handle race conditions and pre-seeded aliases.
+
+4. **Index alias expansion**: At retrieval time, canonical index symbols (e.g. `^GSPC`) are
+   expanded to all known DB aliases (`SPX`, `S&P`, `S&P500`, etc.) so chunks tagged with
+   any variant are matched.
 
 ---
 
@@ -482,9 +530,9 @@ stock-advisor/
 │   │   └── session.py               # Async engine + session factory
 │   ├── ingestion/
 │   │   ├── anonymizer.py            # 3-layer anonymization (Layer 1 + 3)
-│   │   ├── doc_parser.py            # PDF/text ingestion pipeline
+│   │   ├── doc_parser.py            # PDF/text ingestion (single Gemini 3.1 Pro call)
 │   │   ├── excel_parser.py          # Spreadsheet parser (friend's code)
-│   │   └── patreon_parser.py        # Patreon post ingestion pipeline
+│   │   └── patreon_parser.py        # Patreon post ingestion (single Gemini 3.1 Pro multimodal call)
 │   ├── jobs/
 │   │   └── distill_principles.py    # Principle distillation from chunks
 │   ├── llm/
@@ -495,7 +543,7 @@ stock-advisor/
 │   │   └── tables.py               # All ORM models
 │   └── services/
 │       ├── earnings_service.py      # Upcoming earnings calendar
-│       ├── embedding_service.py     # text-embedding-004 via Gemini
+│       ├── embedding_service.py     # gemini-embedding-2-preview (1024d) + qwen3-embedding-4b fallback
 │       ├── price_service.py         # Finnhub + yfinance price/PE fetching
 │       └── rate_limiter.py          # Daily token budget enforcement
 ├── scripts/
@@ -510,43 +558,13 @@ stock-advisor/
 
 ---
 
-## 11. Known Issues and TODOs (from code review, April 2026)
+## 11. Known Issues and TODOs (updated April 2026)
 
 ### Bugs
 
 **B1. `scripts/ingest_excel.py` CLI path never commits (data silently discarded)**
-File: `scripts/ingest_excel.py`, lines 220–225.
-When called from the CLI (`db=None`), the code opens `async with async_session() as session:`
-and calls `await _run(session)` but never calls `await session.commit()`. SQLAlchemy's
-`async_sessionmaker` does not auto-commit on context manager exit. All inserts and updates
-are rolled back when the `async with` block exits. The API path is correct (caller commits).
-Fix: add `await session.commit()` before the `async with` block closes.
-
-**B2. `_summarize_older_messages` receives an un-entered session context manager**
-File: `app/api/chat.py`, line 1078.
-```python
-asyncio.create_task(
-    _summarize_older_messages(uuid.UUID(conv_id), async_session())
-)
-```
-`async_session` is an `async_sessionmaker`. Calling `async_session()` returns an
-`AsyncSession` object that has NOT been entered (i.e., `__aenter__` not called). The
-function `_summarize_older_messages` then calls `await db.execute(...)` on this un-entered
-session, which will raise `sqlalchemy.exc.InvalidRequestError` or similar.
-Fix: wrap it in a helper coroutine that properly enters the session:
-```python
-async def _run_summarize():
-    async with async_session() as db:
-        await _summarize_older_messages(uuid.UUID(conv_id), db)
-asyncio.create_task(_run_summarize())
-```
-
-**B3. `logger` used but never defined in `app/core/security.py`**
-File: `app/core/security.py`, lines 201, 219, 235.
-`logging` is imported but `logger = logging.getLogger(__name__)` is missing. The three
-`logger.warning/info` calls in `ensure_anon_rules_seeded` and `load_anon_rules_into_memory`
-will raise `NameError: name 'logger' is not defined` at runtime if those code paths execute.
-Fix: add `logger = logging.getLogger(__name__)` after the imports.
+File: `scripts/ingest_excel.py`. When called from CLI (`db=None`), the session is never
+committed. API path is correct. Fix: add `await session.commit()` in CLI branch.
 
 ### Security
 

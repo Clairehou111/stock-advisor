@@ -20,60 +20,20 @@ import app.models.tables  # noqa: F401 — ensure all models are registered in B
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: ensure pgvector extension + all tables exist
-    async with engine.begin() as conn:
-        await conn.execute(
-            __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector")
-        )
-        # price_cache replaced by in-memory cache — drop if still exists
-        await conn.execute(
-            __import__("sqlalchemy").text("DROP TABLE IF EXISTS price_cache")
-        )
-        # Add task_type column to ingest_tasks if missing
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "ALTER TABLE ingest_tasks ADD COLUMN IF NOT EXISTS task_type VARCHAR(20) DEFAULT 'patreon'"
-            )
-        )
-        # Migrate embedding column from 768 to 1024 dims (one-time, safe on fresh deploy)
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "DO $$ BEGIN "
-                "ALTER TABLE analyst_chunks ALTER COLUMN embedding TYPE vector(1024) USING NULL; "
-                "EXCEPTION WHEN undefined_table THEN NULL; END $$"
-            )
-        )
-        # Widen trend_status from VARCHAR(255) to TEXT (holds LLM-generated market commentary)
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "DO $$ BEGIN "
-                "ALTER TABLE stock_predictions ALTER COLUMN trend_status TYPE TEXT; "
-                "EXCEPTION WHEN undefined_table THEN NULL; END $$"
-            )
-        )
-        # Create indexes for 3-channel chunk retrieval (safe if already exist)
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_ticker_stale_date "
-                "ON analyst_chunks (ticker, is_stale, publish_date)"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_null_ticker_stale "
-                "ON analyst_chunks (is_stale) WHERE ticker IS NULL"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "CREATE INDEX IF NOT EXISTS ix_analyst_chunks_tickers_mentioned_gin "
-                "ON analyst_chunks USING GIN (tickers_mentioned)"
-            )
-        )
-        await conn.run_sync(Base.metadata.create_all)
-    # Mark any tasks that were "running" when the server last died as errors
-    from sqlalchemy import update as sa_update
+    """App startup: non-destructive bootstrapping only.
+
+    For schema migrations (ALTER TABLE, CREATE INDEX, etc.),
+    run `python -m scripts.migrate` before deploying.
+    """
+    from sqlalchemy import text, update as sa_update
     from app.models.tables import IngestTask
+
+    # Ensure pgvector extension + create any new tables
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Mark interrupted tasks as errors
     async with async_session() as db:
         await db.execute(
             sa_update(IngestTask)
@@ -88,8 +48,8 @@ async def lifespan(app: FastAPI):
         await ensure_aliases_seeded(db)
         await ensure_anon_rules_seeded(db)
         await load_anon_rules_into_memory(db)
+
     yield
-    # Shutdown
     await engine.dispose()
 
 
@@ -100,7 +60,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

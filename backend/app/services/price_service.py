@@ -1,14 +1,11 @@
 """
-Price/fundamentals service — near real-time prices via Finnhub, PE via yfinance.
+Price/fundamentals service — near real-time prices via Finnhub, everything else via yfinance.
 
-Cache: in-memory dict with 30-second TTL (no DB round-trip).
+Single yfinance call per ticker returns: price (fallback), PE, earnings date, name/sector/industry.
+Finnhub provides real-time price; yfinance provides fundamentals + metadata.
+
+Cache: in-memory with 30s TTL for price data, 24h for metadata.
 Zero prices are never cached — they indicate a failed fetch and should be retried.
-
-Flow:
-  1. Check in-memory cache (30s TTL, non-zero only)
-  2. Cache miss: fetch price from Finnhub (real-time, 60 req/min free)
-  3. Fetch PE from yfinance (15min delay is fine for fundamentals)
-  4. Fallback: yfinance price if Finnhub key not configured
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import date
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,8 +23,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL = 30.0  # seconds
-_META_CACHE_TTL = 86400.0  # 24h — name/sector/industry rarely change
+_PRICE_CACHE_TTL = 30.0  # seconds
+_META_CACHE_TTL = 86400.0  # 24h — name/sector/industry/earnings rarely change
 
 
 @dataclass
@@ -38,19 +36,20 @@ class PriceData:
 
 @dataclass
 class TickerMeta:
-    """Cached yfinance metadata for semantic retrieval bridge."""
+    """Cached yfinance metadata for semantic retrieval bridge + earnings."""
     long_name: str
     sector: str
     industry: str
+    earnings_date: date | None = None
 
 
 @dataclass
-class _CacheEntry:
+class _PriceCacheEntry:
     data: PriceData
     fetched_at: float = field(default_factory=time.monotonic)
 
     def is_fresh(self) -> bool:
-        return time.monotonic() - self.fetched_at < _CACHE_TTL
+        return time.monotonic() - self.fetched_at < _PRICE_CACHE_TTL
 
 
 @dataclass
@@ -63,8 +62,11 @@ class _MetaCacheEntry:
 
 
 # Module-level in-memory caches
-_cache: dict[str, _CacheEntry] = {}
+_price_cache: dict[str, _PriceCacheEntry] = {}
 _meta_cache: dict[str, _MetaCacheEntry] = {}
+
+
+# ── Finnhub (real-time price only) ───────────────────────────────────────────
 
 
 async def _fetch_finnhub(ticker: str) -> float:
@@ -78,82 +80,120 @@ async def _fetch_finnhub(ticker: str) -> float:
     return float(price)
 
 
-def _fetch_pe_yfinance(ticker: str) -> float | None:
-    """Synchronous yfinance fetch for PE ratio only."""
-    import yfinance as yf
-    info = yf.Ticker(ticker).info or {}
-    pe = info.get("trailingPE") or info.get("forwardPE")
-    return float(pe) if pe else None
+# ── yfinance (single call: price fallback + PE + earnings + metadata) ────────
 
 
-def _fetch_yfinance_full(ticker: str) -> PriceData:
-    """Synchronous full yfinance fetch (price + PE) — used when Finnhub unavailable."""
+def _fetch_yfinance_all(ticker: str) -> dict:
+    """Single yfinance call returning everything we need.
+
+    Returns dict with: price, pe, long_name, sector, industry, earnings_date
+    """
     import yfinance as yf
-    info = yf.Ticker(ticker).info or {}
+    tk = yf.Ticker(ticker)
+    info = tk.info or {}
+
+    # Price + PE
     price = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
     pe = info.get("trailingPE") or info.get("forwardPE")
-    return PriceData(ticker=ticker, price=float(price), pe_ratio=float(pe) if pe else None)
+
+    # Metadata
+    long_name = info.get("longName") or info.get("shortName") or ticker
+    sector = info.get("sector") or ""
+    industry = info.get("industry") or ""
+
+    # Earnings date
+    earnings_date = None
+    try:
+        cal = tk.calendar
+        if cal is not None and not cal.empty and "Earnings Date" in cal.index:
+            next_date = cal.loc["Earnings Date"].iloc[0]
+            if hasattr(next_date, "date"):
+                earnings_date = next_date.date()
+    except Exception:
+        pass
+
+    return {
+        "price": float(price),
+        "pe": float(pe) if pe else None,
+        "long_name": long_name,
+        "sector": sector,
+        "industry": industry,
+        "earnings_date": earnings_date,
+    }
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
 
 
 async def get_price(ticker: str, db: AsyncSession | None = None) -> PriceData:
-    """
-    Get price + PE for a ticker.
-
-    Uses a 30-second in-memory cache. Zero prices are never cached.
-    The `db` parameter is accepted for backwards compatibility but unused.
-    """
-    entry = _cache.get(ticker)
+    """Get price + PE for a ticker. Uses 30s cache. Finnhub for real-time price,
+    yfinance for PE (fetched together via get_ticker_data)."""
+    entry = _price_cache.get(ticker)
     if entry and entry.is_fresh():
         return entry.data
 
     try:
         if settings.finnhub_api_key:
+            # Finnhub for real-time price, yfinance for PE (parallel)
             price_task = _fetch_finnhub(ticker)
-            pe_task = asyncio.to_thread(_fetch_pe_yfinance, ticker)
-            price, pe_ratio = await asyncio.gather(price_task, pe_task, return_exceptions=True)
+            yf_task = asyncio.to_thread(_fetch_yfinance_all, ticker)
+            price, yf_data = await asyncio.gather(price_task, yf_task, return_exceptions=True)
 
             if isinstance(price, Exception):
-                logger.warning("Finnhub failed for %s: %s — falling back to yfinance", ticker, price)
-                data = await asyncio.to_thread(_fetch_yfinance_full, ticker)
+                logger.warning("Finnhub failed for %s: %s — using yfinance price", ticker, price)
+                if isinstance(yf_data, Exception):
+                    raise yf_data
+                price = yf_data["price"]
+
+            if isinstance(yf_data, Exception):
+                logger.warning("yfinance failed for %s: %s", ticker, yf_data)
+                pe_ratio = None
             else:
-                pe_ratio = None if isinstance(pe_ratio, Exception) else pe_ratio
-                data = PriceData(ticker=ticker, price=price, pe_ratio=pe_ratio)
+                pe_ratio = yf_data["pe"]
+                # Cache metadata from the same yfinance call (free, already fetched)
+                _cache_meta_from_yf(ticker, yf_data)
+
+            data = PriceData(ticker=ticker, price=price, pe_ratio=pe_ratio)
         else:
-            data = await asyncio.to_thread(_fetch_yfinance_full, ticker)
+            yf_data = await asyncio.to_thread(_fetch_yfinance_all, ticker)
+            _cache_meta_from_yf(ticker, yf_data)
+            data = PriceData(ticker=ticker, price=yf_data["price"], pe_ratio=yf_data["pe"])
+
     except Exception:
         logger.exception("Price fetch failed for %s", ticker)
-        # Return stale cache if available, else zero
         if entry:
             return entry.data
         return PriceData(ticker=ticker, price=0.0, pe_ratio=None)
 
-    # Only cache successful fetches — zero means fetch failed
     if data.price > 0:
-        _cache[ticker] = _CacheEntry(data=data)
+        _price_cache[ticker] = _PriceCacheEntry(data=data)
 
     return data
 
 
-def _fetch_yfinance_meta(ticker: str) -> TickerMeta:
-    """Synchronous yfinance fetch for name/sector/industry metadata."""
-    import yfinance as yf
-    info = yf.Ticker(ticker).info or {}
-    return TickerMeta(
-        long_name=info.get("longName") or info.get("shortName") or ticker,
-        sector=info.get("sector") or "",
-        industry=info.get("industry") or "",
+def _cache_meta_from_yf(ticker: str, yf_data: dict) -> None:
+    """Cache metadata + earnings from a yfinance_all result."""
+    meta = TickerMeta(
+        long_name=yf_data["long_name"],
+        sector=yf_data["sector"],
+        industry=yf_data["industry"],
+        earnings_date=yf_data.get("earnings_date"),
     )
+    _meta_cache[ticker] = _MetaCacheEntry(data=meta)
 
 
 async def get_ticker_meta(ticker: str) -> TickerMeta:
-    """Get ticker metadata (name, sector, industry). Cached for 24h."""
+    """Get ticker metadata (name, sector, industry, earnings). Cached for 24h.
+
+    If get_price() was called first, meta is already cached from the same yfinance call.
+    """
     entry = _meta_cache.get(ticker)
     if entry and entry.is_fresh():
         return entry.data
     try:
-        meta = await asyncio.to_thread(_fetch_yfinance_meta, ticker)
-        _meta_cache[ticker] = _MetaCacheEntry(data=meta)
-        return meta
+        yf_data = await asyncio.to_thread(_fetch_yfinance_all, ticker)
+        _cache_meta_from_yf(ticker, yf_data)
+        return _meta_cache[ticker].data
     except Exception:
         logger.warning("yfinance meta fetch failed for %s", ticker)
         if entry:

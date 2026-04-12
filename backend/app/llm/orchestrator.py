@@ -25,7 +25,6 @@ QWEN3_MODEL = "qwen/qwen3-235b-a22b"
 
 class ModelTier(str, Enum):
     QWEN3 = "qwen/qwen3-235b-a22b"
-    GEMINI_FLASH = "gemini-2.5-flash"
     DEEPSEEK_V3 = "deepseek-chat"
 
 
@@ -111,71 +110,6 @@ async def call_openrouter(
     )
 
 
-async def _call_gemini_flash_raw(
-    messages: list[dict],
-    max_tokens: int = 600,
-) -> LLMResponse:
-    """Single attempt at calling Gemini Flash."""
-    api_key = settings.gemini_api_key
-    model = "gemini-2.5-flash"
-    if not api_key:
-        return LLMResponse(content="[Gemini API key not configured]", model_used=model)
-
-    system_instruction = None
-    contents = []
-    for msg in messages:
-        if msg["role"] == "system":
-            system_instruction = msg["content"]
-        else:
-            contents.append({
-                "role": "user" if msg["role"] == "user" else "model",
-                "parts": [{"text": msg["content"]}],
-            })
-
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": 0.1,
-        },
-    }
-    if system_instruction:
-        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    candidates = data.get("candidates", [])
-    if not candidates:
-        return LLMResponse(content="", model_used=model)
-
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = next((p.get("text", "") for p in parts if not p.get("thought")), "")
-    usage = data.get("usageMetadata", {})
-
-    return LLMResponse(
-        content=text,
-        model_used=model,
-        input_tokens=usage.get("promptTokenCount", 0),
-        output_tokens=usage.get("candidatesTokenCount", 0),
-        total_tokens=usage.get("totalTokenCount", 0),
-    )
-
-
-async def call_gemini_flash(
-    messages: list[dict],
-    max_tokens: int = 600,
-) -> LLMResponse:
-    """Call Gemini Flash with retry."""
-    return await retry(
-        _call_gemini_flash_raw, messages, max_tokens=max_tokens,
-        label="Gemini Flash",
-    )
-
 
 async def _call_deepseek_raw(
     messages: list[dict],
@@ -257,15 +191,6 @@ async def chat(
         except Exception as e:
             logger.warning("Qwen3 failed after retries (%s: %s), falling back to DeepSeek", type(e).__name__, e)
 
-        return await call_deepseek(messages, max_tokens=max_tokens)
-
-    elif model_tier == ModelTier.GEMINI_FLASH:
-        try:
-            result = await call_gemini_flash(messages, max_tokens=max_tokens)
-            if result.content:
-                return result
-        except Exception as e:
-            logger.warning("Gemini Flash failed after retries (%s: %s), falling back to DeepSeek", type(e).__name__, e)
         return await call_deepseek(messages, max_tokens=max_tokens)
 
     else:

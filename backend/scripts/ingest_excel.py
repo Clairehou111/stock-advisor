@@ -84,6 +84,9 @@ async def ingest(
     db=None,
     progress_cb=None,
     r2_key: str | None = None,
+    file_sha256: str | None = None,
+    file_size: int | None = None,
+    original_filename: str | None = None,
 ) -> dict | None:
     """
     Ingest Excel workbook.
@@ -91,6 +94,7 @@ async def ingest(
     - When called from API: pass db session, returns result dict.
     - progress_cb: optional async callable(str) for streaming progress messages.
     - r2_key: optional R2 storage key to record on the UploadSource.
+    - file_sha256/file_size/original_filename: optional workbook signature metadata.
     """
     async def _progress(msg: str) -> None:
         logger.info(msg)
@@ -124,6 +128,9 @@ async def ingest(
                 "stock_count": len(current.stocks),
                 "principle_count": len(principles),
                 "snapshot_count": len(wb_data["dated_snapshots"]),
+                "file_sha256": file_sha256,
+                "file_size": file_size,
+                "original_filename": original_filename,
             },
             change_summary=_summarize_diffs(diffs),
         )

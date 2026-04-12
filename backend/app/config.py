@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Analyst persona — public pseudonym used throughout prompts and UI
     analyst_persona: str = "Sid Sloth"
 
+    # CORS — comma-separated list of allowed origins. "*" for development only.
+    cors_origins: str = "http://localhost:8501"  # Streamlit default port
+
     # Sensitive anonymization rules — JSON array of [pattern, replacement, category] tuples
     # Example: [["\\bRealName\\b", "TheAnalyst", "name"], ...]
     # Set this in .env or Railway env vars. Never commit real names to source code.

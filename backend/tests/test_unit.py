@@ -398,15 +398,15 @@ class TestNoIdentityPatternsInDefaultRules:
 # ── 5. price_service.py ───────────────────────────────────────────────────────
 
 import app.services.price_service as price_service_module
-from app.services.price_service import PriceData, _CacheEntry, get_price
+from app.services.price_service import PriceData, _PriceCacheEntry, get_price
 
 
 @pytest.fixture(autouse=False)
 def clear_price_cache():
     """Clear in-memory price cache before each test in this class."""
-    price_service_module._cache.clear()
+    price_service_module._price_cache.clear()
     yield
-    price_service_module._cache.clear()
+    price_service_module._price_cache.clear()
 
 
 class TestPriceServiceCache:
@@ -414,7 +414,7 @@ class TestPriceServiceCache:
     async def test_fresh_cache_returned_within_ttl(self, clear_price_cache):
         ticker = "NVDA"
         cached_data = PriceData(ticker=ticker, price=850.0, pe_ratio=35.0)
-        price_service_module._cache[ticker] = _CacheEntry(data=cached_data)
+        price_service_module._price_cache[ticker] = _PriceCacheEntry(data=cached_data)
 
         with patch("app.services.price_service.settings") as mock_settings:
             mock_settings.finnhub_api_key = ""
@@ -430,9 +430,9 @@ class TestPriceServiceCache:
         ticker = "AAPL"
         stale_data = PriceData(ticker=ticker, price=175.0, pe_ratio=28.0)
         # Manually insert a stale entry (old fetched_at)
-        entry = _CacheEntry(data=stale_data)
+        entry = _PriceCacheEntry(data=stale_data)
         entry.fetched_at = time.monotonic() - 9999.0  # very old
-        price_service_module._cache[ticker] = entry
+        price_service_module._price_cache[ticker] = entry
 
         with patch("app.services.price_service.settings") as mock_settings:
             mock_settings.finnhub_api_key = ""
@@ -452,22 +452,30 @@ class TestPriceServiceCache:
             with patch("app.services.price_service.asyncio.to_thread", side_effect=Exception("timeout")):
                 result = await get_price(ticker)
 
-        assert ticker not in price_service_module._cache
+        assert ticker not in price_service_module._price_cache
         assert result.price == 0.0
 
     @pytest.mark.asyncio
     async def test_successful_fetch_cached(self, clear_price_cache):
         """A successful fetch with nonzero price is written to cache."""
         ticker = "META"
-        fetched_data = PriceData(ticker=ticker, price=550.0, pe_ratio=22.0)
+        fetched_data = {
+            "price": 550.0,
+            "pe": 22.0,
+            "long_name": "Meta Platforms",
+            "sector": "Technology",
+            "industry": "Internet Content & Information",
+            "earnings_date": None,
+        }
 
         with patch("app.services.price_service.settings") as mock_settings:
             mock_settings.finnhub_api_key = ""
             with patch("app.services.price_service.asyncio.to_thread", return_value=fetched_data):
                 result = await get_price(ticker)
 
-        assert ticker in price_service_module._cache
-        assert price_service_module._cache[ticker].data.price == 550.0
+        assert ticker in price_service_module._price_cache
+        assert price_service_module._price_cache[ticker].data.price == 550.0
+        assert result.pe_ratio == 22.0
 
 
 # ── 6. chat.py _classify_message_metadata ────────────────────────────────────
