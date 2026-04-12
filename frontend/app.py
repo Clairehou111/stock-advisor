@@ -541,6 +541,12 @@ def render_chat() -> None:
 
     st.divider()
 
+    user_input = CHAT_INPUT_SLOT.chat_input(
+        "Ask about a stock, your portfolio, or the methodology..."
+    )
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input, "meta": {}})
+
     if st.session_state.active_conversation_notice:
         st.caption(st.session_state.active_conversation_notice)
 
@@ -559,20 +565,16 @@ def render_chat() -> None:
                 if meta.get("is_degraded"):
                     cols[2].caption("⚡ Economy mode")
 
-    user_input = CHAT_INPUT_SLOT.chat_input(
-        "Ask about a stock, your portfolio, or the methodology..."
-    )
     if not user_input:
         return
 
-    st.session_state.messages.append({"role": "user", "content": user_input, "meta": {}})
-
-    with st.spinner("Thinking..."):
-        result = api_chat(
-            message=user_input,
-            conversation_id=st.session_state.conversation_id,
-            token=st.session_state.token,
-        )
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            result = api_chat(
+                message=user_input,
+                conversation_id=st.session_state.conversation_id,
+                token=st.session_state.token,
+            )
 
     _handle_auth_error(result)
     if result and "error" not in result:
